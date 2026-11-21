@@ -31,7 +31,7 @@ flowchart TD
         Retriever["2. Retriever<br/>TF-IDF + cosine similarity"]
         Profile["3. Profile builder<br/>retrieved notes vote on genre, mood,<br/>energy, acoustic preference"]
         Scorer["4. Scorer<br/>energy + mood + genre + acoustic<br/>max 5.0 points"]
-        Generate["5. Answer generator + confidence score<br/>Claude if --llm and key works,<br/>otherwise template"]
+        Generate["5. Answer generator + confidence score<br/>deterministic template<br/>cites notes and score reasons"]
         Guard -->|valid| Retriever --> Profile --> Scorer --> Generate
     end
 
@@ -45,7 +45,7 @@ flowchart TD
     Answer --> User
 
     subgraph CHECKS["Testing and human oversight"]
-        Tests["pytest suite<br/>retrieval, determinism,<br/>guardrails, LLM fallback"]
+        Tests["pytest suite<br/>retrieval, determinism,<br/>guardrails, confidence"]
         Eval["Evaluation harness (src/evaluate.py)<br/>26 labeled requests, pass/fail,<br/>confidence, repeatability"]
         Log[("logs/recommender.log")]
         Human["Human reviewer<br/>reads cited sources and score reasons,<br/>checks the log"]
@@ -65,7 +65,7 @@ flowchart TD
 2. **Retriever** ranks the 26 notes in [data/knowledge_base.json](data/knowledge_base.json) (activities, genres, moods) against the request using TF-IDF cosine similarity. If no note is similar enough, the system says so instead of guessing.
 3. **Profile builder** lets the top 3 notes vote, weighted by similarity, on genre, mood, target energy and acoustic preference. Genres and moods the catalog doesn't have are ignored.
 4. **Scorer** is the original VibeMatch 1.0 rule (energy closeness 2.0, mood 1.5, genre 1.0, acoustic fit 0.5) applied to the 20-song catalog.
-5. **Answer generator** attaches a **confidence score** (0 to 1, explained under Testing Summary) and writes the answer, citing the retrieved notes and the per-song score breakdown. With `--llm`, Claude writes the explanation from the retrieved notes; if that is unavailable it falls back to a deterministic template.
+5. **Answer generator** attaches a **confidence score** (0 to 1, explained under Testing Summary) and writes the answer, citing the retrieved notes and the per-song score breakdown. The answer comes from a deterministic template, so the same request always produces the same output with no network or API key.
 
 **Where people and tests check the AI:** the `pytest` suite verifies each stage, every step is logged to `logs/recommender.log`, and a human reviewer can read the cited sources and score reasons on each answer and then fix the knowledge base, weights or tests.
 
@@ -78,7 +78,7 @@ flowchart TD
 | [data/songs.csv](data/songs.csv) | 20-song catalog |
 | [src/evaluate.py](src/evaluate.py) | Evaluation harness: 26 labeled requests, confidence and repeatability report |
 | [docs/evaluation_results.md](docs/evaluation_results.md) | Latest evaluation results table |
-| [tests/](tests) | 23 automated tests |
+| [tests/](tests) | 22 automated tests |
 
 ## Setup Instructions
 
@@ -105,7 +105,7 @@ Requires Python 3.10 or newer. Run all commands from the project root.
    pip install -r requirements.txt
    ```
 
-   Only `pytest` is required. The `anthropic` package is optional and used only by `--llm`.
+   Only `pytest` is required. There are no API keys or network calls.
 
 4. **Ask for recommendations**
 
@@ -123,13 +123,6 @@ Requires Python 3.10 or newer. Run all commands from the project root.
 
    ```bash
    python -m src.evaluate
-   ```
-
-6. **Optional: Claude-written explanations.** Set an API key, then add `--llm`. Without a key, or if the call fails, the app falls back to the built-in template and says so.
-
-   ```bash
-   export ANTHROPIC_API_KEY=your-key      # PowerShell: $env:ANTHROPIC_API_KEY = "your-key"
-   python -m src.main --ask "something calm for studying" --llm
    ```
 
 Other commands: `python -m src.main` runs the six original profiles, `--profile NAME` runs one, and `--experiment weight_shift|no_mood` runs the original weight experiments. Logs are written to `logs/recommender.log`.
@@ -223,23 +216,23 @@ Note: Your request mixes very different energy levels, so I blended them; the re
 
 ## Design Decisions
 
-- **RAG over a plain LLM.** The profile is built only from retrieved notes, so the answer is grounded in data I can read, edit and test. A chat model asked to "recommend songs" could invent songs that are not in the catalog. Here the model (or template) can only explain songs the scorer actually ranked.
+- **RAG that drives the result.** The profile is built only from retrieved notes, so the answer is grounded in data I can read, edit and test. The song list always comes from the scorer, so the system cannot recommend a song that is not in the catalog.
 - **Reused the original scorer.** The new feature changes how the profile is created, not how songs are scored. That kept the proven, explainable scoring rule from Modules 1-3 and made it easy to tell whether a change came from retrieval or from scoring.
 - **Plain-Python TF-IDF instead of embeddings.** There is no model download, no API key and no extra dependency, and results are fully deterministic, so tests can assert exact behavior. The trade-off is that it matches words, not meaning (see Testing Summary).
-- **Offline by default, LLM optional.** Retrieval, profile building and the template answer need no network. The `--llm` flag is a thin layer that always falls back, so a missing key or network error never breaks the app.
+- **No generative model, on purpose.** I first built an optional Claude-written explanation and then removed it. The template already explains every pick from the retrieved notes and the score breakdown, so a language model added an API key, a network dependency, cost, prompt-injection risk and non-deterministic output, and I could not test it here. Removing it kept the project simple, reproducible and fully testable offline.
 - **A small hand-written knowledge base.** 26 short notes are easy to audit and fix, but they limit what the system understands. Each note carries structured hints (genre, mood, energy, acoustic) so retrieved text can directly drive the profile.
 - **Guardrails fail safe.** Bad input, no matching note, a malformed data file, and any unexpected error each produce a clear message or error result instead of a crash or a made-up answer. Every step is logged.
 - **Weighted voting for blended requests.** When several notes match, they vote by similarity. That handles "relaxing jazz for dinner" well, but it can average conflicting requests into a middle that satisfies neither half (see Testing Summary).
 
 ## Testing Summary
 
-**In short:** 23 of 23 automated tests pass. The evaluation harness passes 25 of 25 expected-to-pass requests, repeats identically 15 of 15 times, and has 1 documented known failure. Mean confidence was 0.83 on answerable requests and 0.38 on out-of-scope requests that were still answered. Adding confidence scoring fixed the main silent failure I found in manual testing.
+**In short:** 22 of 22 automated tests pass. The evaluation harness passes 25 of 25 expected-to-pass requests, repeats identically 15 of 15 times, and has 1 documented known failure. Mean confidence was 0.83 on answerable requests and 0.38 on out-of-scope requests that were still answered. Adding confidence scoring fixed the main silent failure I found in manual testing.
 
 The system is checked four ways:
 
-1. **Automated tests.** `python -m pytest` runs 23 tests ([tests/test_rag.py](tests/test_rag.py) and the original [tests/test_recommender.py](tests/test_recommender.py)): retrieval finds the right note and returns nothing for gibberish; different retrieved notes change the recommendations; answers cite their sources; results are repeatable; every guardrail rejects bad input; `--llm` falls back safely; a corrupt knowledge base raises a clear error; and confidence behaves as intended. One test runs the whole evaluation suite as a regression check.
+1. **Automated tests.** `python -m pytest` runs 22 tests ([tests/test_rag.py](tests/test_rag.py) and the original [tests/test_recommender.py](tests/test_recommender.py)): retrieval finds the right note and returns nothing for gibberish; different retrieved notes change the recommendations; answers cite their sources; results are repeatable; every guardrail rejects bad input; a corrupt knowledge base raises a clear error; and confidence behaves as intended. One test runs the whole evaluation suite as a regression check.
 2. **Confidence scoring.** Every answer ends with a score from 0 to 1: `strength x coverage`, where *strength* is how well the best note matches (similarity relative to a strong match) and *coverage* is the share of the request's words that appear anywhere in the knowledge base. Score is halved when the retrieved notes disagree about energy. Below 0.45 the answer is labeled "treat these picks with caution", and the words that weren't understood are listed.
-3. **Logging and error handling.** Requests, retrieved notes, profiles, low-confidence warnings, LLM fallbacks and exceptions are written to `logs/recommender.log`. Every failure path returns a message or an error result instead of crashing.
+3. **Logging and error handling.** Requests, retrieved notes, profiles, low-confidence warnings and exceptions are written to `logs/recommender.log`. Every failure path returns a message or an error result instead of crashing.
 4. **Evaluation harness.** `python -m src.evaluate` runs 26 labeled requests through the real pipeline and writes [docs/evaluation_results.md](docs/evaluation_results.md), a table with each input, criteria, result and confidence.
 
 | Group | Passed | What it checks |
@@ -258,7 +251,6 @@ The system is checked four ways:
 - **Confidence is conservative.** "Feeling confident getting ready to go out" retrieved exactly the right note and a hip hop song, yet scored only 0.33 because several of its words aren't in the notes. A correct answer can look unsure.
 - **Confidence can't catch everything.** "Chill beats for a rainy afternoon" returned jazz at 0.64 (medium). I accepted jazz or lofi there, since both fit, but the user may have wanted lofi.
 - **The evaluation set is not independent.** I wrote it after trying many requests by hand, so a 25 of 25 pass rate overstates how well it would do on a stranger's requests. It is a regression check and a demonstration, not an unbiased accuracy estimate. A fair measurement needs requests collected from other people.
-- **Not run:** the `--llm` path has not been exercised against the live API.
 
 The main lesson is that tests prove the system is repeatable and safe, but a system also has to know when it might be wrong. The most useful bugs came from typing requests I hadn't designed for, and the most useful fix was making the system admit uncertainty.
 

@@ -1,4 +1,1 @@
 pytest
-# Optional: only needed for `--ask ... --llm` (Claude-written answers).
-# Also set the ANTHROPIC_API_KEY environment variable.
-anthropic

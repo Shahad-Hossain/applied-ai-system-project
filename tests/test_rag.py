@@ -70,12 +70,6 @@ def test_unmatched_request_fails_safely(songs, retriever):
     assert result.status == "no_match" and result.recommendations == []
 
 
-def test_llm_flag_falls_back_without_api_key(songs, retriever, monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    result = ask("something calm for studying", songs, retriever, use_llm=True)
-    assert result.status == "ok" and not result.used_llm and result.answer
-
-
 def test_bad_knowledge_base_raises_clear_error(tmp_path):
     bad = tmp_path / "kb.json"
     bad.write_text("not json")

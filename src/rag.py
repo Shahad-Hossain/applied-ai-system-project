@@ -10,9 +10,9 @@ A listener types a free-text request ("something calm for studying"). The pipeli
                   energy, acoustic preference). The profile comes ONLY from retrieved
                   notes, so different retrieved notes produce different recommendations.
   4. RECOMMEND    score the song catalog with the existing recommender
-  5. GENERATE     write an answer that cites the notes it used. If an Anthropic API key
-                  is available and use_llm=True, Claude writes the answer from the
-                  retrieved notes; otherwise a deterministic template is used.
+  5. GENERATE     write an answer that cites the notes it used, with a confidence score.
+                  The answer is built by a deterministic template, so the same request
+                  always produces the same output and needs no network or API key.
 
 Every stage is logged to logs/recommender.log.
 """
@@ -20,7 +20,6 @@ Every stage is logged to logs/recommender.log.
 import json
 import logging
 import math
-import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -38,7 +37,6 @@ MAX_QUERY_CHARS = 300
 MIN_QUERY_CHARS = 3
 MIN_SIMILARITY = 0.08   # a retrieved note below this similarity is ignored
 TOP_K_DOCS = 3          # notes used to build the profile
-LLM_MODEL = "claude-haiku-5-5"
 
 # Confidence scoring (see compute_confidence)
 STRONG_MATCH = 0.35        # top similarity at or above this counts as a fully strong match
@@ -253,7 +251,6 @@ class RagResult:
     profile: Dict = field(default_factory=dict)
     recommendations: List[Tuple[Dict, float, str]] = field(default_factory=list)
     answer: str = ""
-    used_llm: bool = False
     confidence: float = 0.0
     warnings: List[str] = field(default_factory=list)
 
@@ -278,36 +275,7 @@ def _template_answer(query: str, sources, profile: Dict, recs) -> str:
     return "\n".join(lines)
 
 
-def _llm_answer(query: str, sources, profile: Dict, recs) -> Optional[str]:
-    """Asks Claude to write the answer from the retrieved notes. Returns None on any failure."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        logger.info("LLM requested but ANTHROPIC_API_KEY is not set; using template")
-        return None
-    try:
-        import anthropic
-
-        notes = "\n".join(f"- {d.title}: {d.text}" for d, _ in sources)
-        picks = "\n".join(f"{i}. {s['title']} by {s['artist']} ({s['genre']}/{s['mood']}, "
-                          f"energy {s['energy']}): {why}" for i, (s, _, why) in enumerate(recs, 1))
-        prompt = (
-            f'A listener asked: "{query}"\n\nRetrieved notes:\n{notes}\n\n'
-            f"Profile derived from the notes: {profile}\n\nRanked songs:\n{picks}\n\n"
-            "In 3-4 friendly sentences, explain why these songs fit the request. Use ONLY the "
-            "notes and songs above, mention at least one retrieved note by name, and do not "
-            "invent songs or facts."
-        )
-        client = anthropic.Anthropic(timeout=20.0)
-        response = client.messages.create(
-            model=LLM_MODEL, max_tokens=300, messages=[{"role": "user", "content": prompt}]
-        )
-        text = "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
-        return text.strip() or None
-    except Exception as exc:  # network, auth, missing package: always fall back
-        logger.warning("LLM call failed (%s: %s); using template", type(exc).__name__, exc)
-        return None
-
-
-def ask(query, songs: List[Dict], retriever: Retriever, k: int = 5, use_llm: bool = False) -> RagResult:
+def ask(query, songs: List[Dict], retriever: Retriever, k: int = 5) -> RagResult:
     """Full RAG pipeline: request in, cited recommendations out. Never raises."""
     clean, problem = validate_query(query)
     if problem:
@@ -336,21 +304,14 @@ def ask(query, songs: List[Dict], retriever: Retriever, k: int = 5, use_llm: boo
         recs = recommend_songs(profile, songs, k=k)
         logger.info("Profile %s -> top pick %s", profile, recs[0][0]["title"] if recs else None)
 
-        answer = _llm_answer(clean, sources, profile, recs) if use_llm else None
-        used_llm = answer is not None
-        if answer is None:
-            answer = _template_answer(clean, sources, profile, recs)
-        elif used_llm:
-            answer += "\n\nSongs:\n" + "\n".join(
-                f"  {i}. {s['title']} by {s['artist']} - score {sc:.2f}" for i, (s, sc, _) in enumerate(recs, 1)
-            )
+        answer = _template_answer(clean, sources, profile, recs)
         answer += f"\n\nConfidence: {confidence:.2f} ({confidence_label(confidence)})"
         if confidence < LOW_CONFIDENCE:
             answer += " - treat these picks with caution."
         for warning in warnings:
             answer += f"\nNote: {warning}"
         return RagResult("ok", clean, sources=sources, profile=profile, recommendations=recs,
-                         answer=answer, used_llm=used_llm, confidence=confidence, warnings=warnings)
+                         answer=answer, confidence=confidence, warnings=warnings)
     except Exception as exc:  # last-resort guardrail
         logger.exception("Pipeline failure for %r", clean)
         return RagResult("error", clean, message=f"Something went wrong ({type(exc).__name__}); see {LOG_PATH}.")
