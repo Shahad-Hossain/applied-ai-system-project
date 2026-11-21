@@ -40,10 +40,16 @@ MIN_SIMILARITY = 0.08   # a retrieved note below this similarity is ignored
 TOP_K_DOCS = 3          # notes used to build the profile
 LLM_MODEL = "claude-haiku-5-5"
 
+# Confidence scoring (see compute_confidence)
+STRONG_MATCH = 0.35        # top similarity at or above this counts as a fully strong match
+CONFLICT_SPREAD = 0.40     # retrieved notes whose energy hints differ by more than this conflict
+HIGH_CONFIDENCE = 0.70
+LOW_CONFIDENCE = 0.45
+
 STOPWORDS = frozenset(
     "a an and are as at be but by for from i im in is it me my of on or so some that "
     "the this to want with would like need something music songs song play give "
-    "please can could just really very some something".split()
+    "please can could just really very some something also too".split()
 )
 
 EXAMPLE_QUERIES = [
@@ -181,6 +187,45 @@ def build_profile(retrieved: List[Tuple[Doc, float]], catalog_genres: set, catal
     return profile
 
 
+# --------------------------------------------------------------------------- confidence
+
+def confidence_label(score: float) -> str:
+    return "high" if score >= HIGH_CONFIDENCE else "low" if score < LOW_CONFIDENCE else "medium"
+
+
+def compute_confidence(query: str, retrieved: List[Tuple[Doc, float]], retriever: "Retriever") -> Tuple[float, List[str]]:
+    """
+    Rates how sure the system is that its answer fits the request (0.0 to 1.0).
+
+      strength  = top similarity / STRONG_MATCH, capped at 1
+      coverage  = share of the request's content words that appear anywhere in the knowledge base
+      confidence = strength * coverage, halved when the retrieved notes disagree about energy
+
+    Returns (confidence, human-readable warnings).
+    """
+    warnings: List[str] = []
+    if not retrieved:
+        return 0.0, warnings
+
+    strength = min(1.0, retrieved[0][1] / STRONG_MATCH)
+
+    tokens = tokenize(query)
+    unknown = sorted({t for t in tokens if t not in retriever.idf})
+    coverage = 1 - len(unknown) / len(tokens) if tokens else 0.0
+    if unknown:
+        warnings.append("My notes don't cover: " + ", ".join(unknown) + ". Those words were ignored.")
+
+    confidence = strength * coverage
+
+    energies = [d.hint["energy"] for d, _ in retrieved if isinstance(d.hint.get("energy"), (int, float))]
+    if len(energies) > 1 and max(energies) - min(energies) > CONFLICT_SPREAD:
+        confidence *= 0.5
+        warnings.append("Your request mixes very different energy levels, so I blended them; "
+                        "the result may satisfy neither half.")
+
+    return round(confidence, 2), warnings
+
+
 # --------------------------------------------------------------------------- guardrails
 
 def validate_query(query) -> Tuple[Optional[str], Optional[str]]:
@@ -209,6 +254,8 @@ class RagResult:
     recommendations: List[Tuple[Dict, float, str]] = field(default_factory=list)
     answer: str = ""
     used_llm: bool = False
+    confidence: float = 0.0
+    warnings: List[str] = field(default_factory=list)
 
 
 def _template_answer(query: str, sources, profile: Dict, recs) -> str:
@@ -283,6 +330,9 @@ def ask(query, songs: List[Dict], retriever: Retriever, k: int = 5, use_llm: boo
         if not profile:
             return RagResult("no_match", clean, message="The notes I found don't map onto this catalog.")
 
+        confidence, warnings = compute_confidence(clean, sources, retriever)
+        if confidence < LOW_CONFIDENCE:
+            logger.warning("Low confidence %.2f for %r: %s", confidence, clean, warnings)
         recs = recommend_songs(profile, songs, k=k)
         logger.info("Profile %s -> top pick %s", profile, recs[0][0]["title"] if recs else None)
 
@@ -294,8 +344,13 @@ def ask(query, songs: List[Dict], retriever: Retriever, k: int = 5, use_llm: boo
             answer += "\n\nSongs:\n" + "\n".join(
                 f"  {i}. {s['title']} by {s['artist']} - score {sc:.2f}" for i, (s, sc, _) in enumerate(recs, 1)
             )
-        return RagResult("ok", clean, sources=sources, profile=profile,
-                         recommendations=recs, answer=answer, used_llm=used_llm)
+        answer += f"\n\nConfidence: {confidence:.2f} ({confidence_label(confidence)})"
+        if confidence < LOW_CONFIDENCE:
+            answer += " - treat these picks with caution."
+        for warning in warnings:
+            answer += f"\nNote: {warning}"
+        return RagResult("ok", clean, sources=sources, profile=profile, recommendations=recs,
+                         answer=answer, used_llm=used_llm, confidence=confidence, warnings=warnings)
     except Exception as exc:  # last-resort guardrail
         logger.exception("Pipeline failure for %r", clean)
         return RagResult("error", clean, message=f"Something went wrong ({type(exc).__name__}); see {LOG_PATH}.")

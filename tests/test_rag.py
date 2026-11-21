@@ -81,3 +81,35 @@ def test_bad_knowledge_base_raises_clear_error(tmp_path):
     bad.write_text("not json")
     with pytest.raises(ValueError):
         load_knowledge_base(str(bad))
+
+
+# ----------------------------------------------------------------- confidence scoring
+
+def test_confidence_high_for_clear_request(songs, retriever):
+    result = ask("something calm for studying", songs, retriever)
+    assert result.confidence >= 0.7 and "Confidence:" in result.answer
+
+
+def test_confidence_low_when_words_are_not_covered(songs, retriever):
+    clear = ask("something calm for studying", songs, retriever)
+    vague = ask("classical piano", songs, retriever)
+    assert vague.confidence < 0.45 < clear.confidence
+    assert any("classical" in w for w in vague.warnings)
+    assert "caution" in vague.answer
+
+
+def test_conflicting_energy_is_flagged_and_lowers_confidence(songs, retriever):
+    result = ask("something sad but also really loud", songs, retriever)
+    assert any("mixes very different energy" in w for w in result.warnings)
+    assert result.confidence <= 0.5
+
+
+# ----------------------------------------------------------------- evaluation harness
+
+def test_evaluation_suite_has_no_unexpected_failures(songs, retriever):
+    from src.evaluate import evaluate
+
+    rows, repeat_ok, repeat_total = evaluate(songs, retriever)
+    failures = [c["query"] for c, ok, _, _ in rows if not ok and not c.get("known_limit")]
+    assert failures == []
+    assert repeat_ok == repeat_total

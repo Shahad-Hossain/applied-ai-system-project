@@ -6,7 +6,7 @@ flowchart TD
         Retriever["2. Retriever<br/>TF-IDF + cosine similarity"]
         Profile["3. Profile builder<br/>retrieved notes vote on genre, mood,<br/>energy, acoustic preference"]
         Scorer["4. Scorer<br/>energy + mood + genre + acoustic<br/>max 5.0 points"]
-        Generate["5. Answer generator<br/>Claude if --llm and key works,<br/>otherwise template"]
+        Generate["5. Answer generator + confidence score<br/>Claude if --llm and key works,<br/>otherwise template"]
         Guard -->|valid| Retriever --> Profile --> Scorer --> Generate
     end
 
@@ -21,11 +21,13 @@ flowchart TD
 
     subgraph CHECKS["Testing and human oversight"]
         Tests["pytest suite<br/>retrieval, determinism,<br/>guardrails, LLM fallback"]
+        Eval["Evaluation harness (src/evaluate.py)<br/>26 labeled requests, pass/fail,<br/>confidence, repeatability"]
         Log[("logs/recommender.log")]
         Human["Human reviewer<br/>reads cited sources and score reasons,<br/>checks the log"]
     end
 
     Tests -.->|verifies| PIPE
+    Eval -.->|measures| PIPE
     PIPE -.->|"logs every step"| Log
     Answer --> Human
     Log --> Human
