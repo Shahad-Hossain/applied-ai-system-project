@@ -1,8 +1,10 @@
-# 🎧 Model Card: Music Recommender Simulation
+# 🎧 Model Card: VibeMatch Music Recommender
+
+Sections 1-9 describe the original recommender (VibeMatch 1.0, Modules 1-3). **Section 10 is the responsible-AI reflection for the extended system, VibeMatch 2.0**, which adds retrieval-augmented generation, confidence scoring and an evaluation harness.
 
 ## 1. Model Name
 
-**VibeMatch 1.0**
+**VibeMatch 1.0** (original scorer), extended as **VibeMatch 2.0** (adds a retrieval-augmented request interface)
 
 ---
 
@@ -11,6 +13,8 @@
 VibeMatch suggests songs from a small catalog that fit one user's taste.
 
 It tries to predict which songs a user would like best. It compares each song to the user's favorite genre, favorite mood, target energy, and whether they like acoustic music. Then it shows the top 5 songs with reasons.
+
+In version 2.0 the user can type a plain-English request (for example "something calm for studying"). The system retrieves matching notes from a 26-note knowledge base, builds the taste profile from those notes, scores the same catalog, and explains its picks with the notes it used and a confidence score.
 
 ---
 
@@ -129,7 +133,7 @@ The other pairs follow the same pattern: the more preferences two users share, t
 
 ---
 
-## 9. Personal Reflection
+## 9. Personal Reflection (VibeMatch 1.0)
 
 **Biggest learning moment.** I thought the hard part would be the math. It was actually the weights. I tried the common starting point of giving genre 2.0 and mood 1.0. A rock fan who wanted chill songs got loud rock songs first. That showed me one number can quietly decide who gets what.
 
@@ -138,3 +142,48 @@ The other pairs follow the same pattern: the more preferences two users share, t
 **What surprised me.** A few simple rules felt like a real recommendation. Seeing "mood match (+1.5)" next to a song made it feel smart, even though it is only adding points. It also showed me how a system can look confident when it is wrong, like when it gave results for a mood that was not in the catalog.
 
 **What I would try next.** I would add partial credit for similar moods and genres, let users pick more than one favorite, and add many more songs. I would also try the "people like you" idea from apps like Spotify, so the system is not only comparing song labels.
+
+---
+
+## 10. Responsible AI Reflection (VibeMatch 2.0)
+
+### 10.1 Limitations and biases
+
+- **The knowledge base reflects my assumptions.** I wrote all 26 notes by hand, so they encode my ideas of what music "fits" an activity or feeling: studying means lofi, a breakup means folk, a workout means EDM. Someone else might study to classical or work out to rock. The system presents these as facts, not one person's opinion.
+- **It only knows what the catalog and notes contain.** The catalog is 20 invented songs in 10 mostly Western pop-style genres. A request for a genre, language or culture outside that gets the nearest thing, which can feel like the system is quietly telling the user their taste doesn't exist. Confidence scoring now flags some of these cases ("classical piano" scores 0.43, low), but it still returns songs.
+- **Retrieval matches words, not meaning.** "Classical piano" matched the Jazz note only because both mention piano. A request phrased in words my notes don't use fails or gets matched by accident.
+- **Conflicting requests are averaged.** "Something sad but also really loud" blends sad notes (energy about 0.32) with intense notes (about 0.90) into a target of 0.43. The system now warns about this, but the top pick is still a quiet song, so the "loud" half is lost.
+- **Confidence is a rough signal, not a guarantee.** It is conservative (a correct answer for "feeling confident getting ready to go out" scored only 0.33) and it can't catch a plausible but wrong match ("chill beats for a rainy afternoon" returned jazz at 0.64).
+- **My evaluation is not independent.** I wrote the 26 test requests after trying many by hand, so the 25 of 25 pass rate overstates real-world accuracy. It shows the system is repeatable and regression-safe, not that it would do well for strangers.
+- **Inherited limits from 1.0 still apply:** one genre and one mood per profile, no lyrics or popularity, label matching with no partial credit, and a small catalog where the same songs recur (see section 5).
+- **Not verified:** the optional Claude-written explanation path (`--llm`) has never run against the live API. A language model can add claims that were not in the notes even when told not to, and the system has no check for that.
+
+### 10.2 Could this AI be misused, and how do I prevent it?
+
+The system is low-stakes: it ranks 20 invented songs and takes no actions. Realistic risks are small but real:
+
+- **Prompt injection through the request.** With `--llm`, the user's text goes into a Claude prompt, so a request like "ignore your instructions and..." could change the wording of the explanation. Mitigations: requests are limited to 300 characters, the model gets only retrieved notes and ranked catalog songs (no files, tools or secrets), the model is told to describe only songs the scorer already ranked (this is an instruction, not something the code enforces), and any failure falls back to a fixed template. The same risk would apply to the knowledge base if untrusted people could edit it, because its text is also placed in the prompt. Today it is a reviewed local file; a deployed version would need the same review step.
+- **Cost abuse of an API key.** Without limits, someone could send huge or repeated requests. The input length cap and the fact that `--llm` is off by default reduce this. A real deployment would also need rate limiting.
+- **Privacy.** Requests like "sad songs after a breakup" reveal a person's emotional state, and the logger writes each raw request to `logs/recommender.log`. The log is local and git-ignored, but it should not be shared, and a real product would need to anonymize or delete logs and say what it keeps.
+- **Misleading output.** A recommender that sounds sure of itself can make people trust it too much. Showing the retrieved sources, the score breakdown and the confidence score is meant to keep a human able to check it. I would not use it for anything where a wrong answer matters, such as inferring someone's mental state from what they listen to.
+- **Not a real catalog.** The songs and artists are invented. Presenting the output as real recommendations of real music would be misleading.
+
+### 10.3 What surprised me while testing reliability
+
+- **Similarity alone could not tell right from wrong.** I assumed a low retrieval score would signal a bad answer. But "classical piano" matched the wrong note at 0.30, about the same as correct matches like "sad songs after a breakup" (0.31). I had to add a second signal (how many of the user's words the notes actually cover) before the system could tell it was out of its depth.
+- **A tiny word can change retrieval.** "Pump-up songs for the gym" pulled in the "Morning and good mood" note because both contain the word "up". The top answer was right, but it showed how fragile word matching is.
+- **A correct answer can look unsure.** Confidence dropped to 0.33 on a request that got the right note and the right song, because it contained filler words my notes don't use. Making a system admit uncertainty also makes it admit uncertainty when it is right.
+- **A perfect score felt reassuring and was misleading.** 25 of 25 passing looked great until I remembered I had written the test set after seeing the system's behavior. The most useful findings came from typing requests I had not designed for, not from the passing tests.
+- **Flagging a problem did not fix it.** The sad-but-loud request is now detected and warned about, yet the recommendation barely changed. Detecting a failure and handling it are separate jobs.
+
+### 10.4 Collaboration with AI
+
+I built this version with Claude Code, working through the assignment one step at a time. I pasted in each step, and Claude read the existing code, wrote the code, tests, diagram source and documentation, and ran them. I made the project-level decisions (which repo was the real one, what to commit and push, when to push, and the Mermaid diagram exports) and decided when to move on to the next step. For the first step I gave Claude full control over which AI feature to add.
+
+**One suggestion I accepted.** For the AI feature, Claude chose retrieval-augmented generation and proposed a plain-Python TF-IDF retriever instead of an embedding model, with the retrieved notes building the taste profile and a deterministic template writing the answer. I accepted it because it needs no model download or API key, gives the same answer every time (so tests can check exact behavior), and makes the "retrieved data actually changes the result" requirement easy to prove: a studying request and a gym request retrieve different notes and return different songs. The trade-off is that it matches words, not meaning, which caused the "classical piano" mistake described above.
+
+**One suggestion I did not accept as written.** Claude proposed having a Claude model write the final explanation (the `--llm` option). I did not accept that as the core of the system. I am not sure I have access to a paid Claude plan, so I could not test it, and I may switch to a different provider such as Gemini later. It stays an optional layer that falls back to the template when there is no key or the call fails, and I treat it as unverified in the README and in this card. It was a poor fit for my situation, not a bad suggestion, and the design made it easy to leave out because the retrieval, scoring and tests do not depend on it.
+
+**One suggestion that was revised.** Claude's first architecture diagram had many dotted "verify" and "log" lines going from each component to each other, and when I exported it the image was very tall and the lines crossed everywhere. Claude judged it hard to read after looking at the export and rewrote it with fewer connections (one "verifies" line and one "logs" line for the whole pipeline) before I re-exported the PNG.
+
+**What I would do differently.** I would write the evaluation requests before building the retriever, and ask other people for their own requests so the test set isn't shaped by what I already knew the system could do. I would also ask Claude to try to break each feature (as it did when it tried requests like "classical piano") earlier, instead of after the first version looked finished.
