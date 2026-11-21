@@ -3,7 +3,8 @@
 Describe what you want to listen to in plain English, and VibeMatch looks up music knowledge, turns it into a taste profile, and recommends songs with a cited explanation for every pick.
 
 ```bash
-python -m src.main --ask "something calm for studying"
+streamlit run app.py                                    # graphical app
+python -m src.main --ask "something calm for studying"   # command line
 ```
 
 ## Original Project (Modules 1-3)
@@ -24,14 +25,15 @@ The diagram is rendered from [diagrams/architecture.mmd](diagrams/architecture.m
 
 ```mermaid
 flowchart TD
-    User([Listener]) -->|"free-text request"| Guard
+    User([Listener]) -->|"free-text request"| UI["Streamlit app (app.py)<br/>or command line (src/main.py)"]
+    UI --> Guard
 
     subgraph PIPE["RAG pipeline (src/rag.py + src/recommender.py)"]
         Guard{"1. Guardrails<br/>text, 3-300 chars, has letters?"}
         Retriever["2. Retriever<br/>TF-IDF + cosine similarity"]
         Profile["3. Profile builder<br/>retrieved notes vote on genre, mood,<br/>energy, acoustic preference"]
         Scorer["4. Scorer<br/>energy + mood + genre + acoustic<br/>max 5.0 points"]
-        Generate["5. Answer generator + confidence score<br/>deterministic template<br/>cites notes and score reasons"]
+        Generate["5. Answer generator + confidence score<br/>template by default,<br/>cites notes and score reasons"]
         Guard -->|valid| Retriever --> Profile --> Scorer --> Generate
     end
 
@@ -40,12 +42,15 @@ flowchart TD
 
     Guard -->|invalid| Msg["Friendly message"]
     Retriever -->|"no matching note"| Msg
-    Msg --> User
+    Msg --> UI
+    Gemini(["Gemini API<br/>optional, off by default,<br/>falls back to template"])
+    Generate <-.->|"optional explanation"| Gemini
     Generate --> Answer["Answer: cited notes,<br/>profile, top 5 songs with reasons"]
-    Answer --> User
+    Answer --> UI
+    UI --> User
 
     subgraph CHECKS["Testing and human oversight"]
-        Tests["pytest suite<br/>retrieval, determinism,<br/>guardrails, confidence"]
+        Tests["pytest suite<br/>retrieval, determinism,<br/>guardrails, confidence,<br/>mocked Gemini, GUI"]
         Eval["Evaluation harness (src/evaluate.py)<br/>26 labeled requests, pass/fail,<br/>confidence, repeatability"]
         Log[("logs/recommender.log")]
         Human["Human reviewer<br/>reads cited sources and score reasons,<br/>checks the log"]
@@ -65,7 +70,7 @@ flowchart TD
 2. **Retriever** ranks the 26 notes in [data/knowledge_base.json](data/knowledge_base.json) (activities, genres, moods) against the request using TF-IDF cosine similarity. If no note is similar enough, the system says so instead of guessing.
 3. **Profile builder** lets the top 3 notes vote, weighted by similarity, on genre, mood, target energy and acoustic preference. Genres and moods the catalog doesn't have are ignored.
 4. **Scorer** is the original VibeMatch 1.0 rule (energy closeness 2.0, mood 1.5, genre 1.0, acoustic fit 0.5) applied to the 20-song catalog.
-5. **Answer generator** attaches a **confidence score** (0 to 1, explained under Testing Summary) and writes the answer, citing the retrieved notes and the per-song score breakdown. The answer comes from a deterministic template, so the same request always produces the same output with no network or API key.
+5. **Answer generator** attaches a **confidence score** (0 to 1, explained under Testing Summary) and writes the answer, citing the retrieved notes and the per-song score breakdown. By default the answer comes from a deterministic template, so the same request always produces the same output with no network or API key. Optionally (the "Write the explanation with Gemini" checkbox in the app, or `--llm` on the command line) Gemini writes a short explanation from the retrieved notes and the already-ranked songs; it never changes the ranking, and any failure falls back to the template.
 
 **Where people and tests check the AI:** the `pytest` suite verifies each stage, every step is logged to `logs/recommender.log`, and a human reviewer can read the cited sources and score reasons on each answer and then fix the knowledge base, weights or tests.
 
@@ -73,12 +78,15 @@ flowchart TD
 |---|---|
 | [src/rag.py](src/rag.py) | Guardrails, retriever, profile builder, answer generation, logging |
 | [src/recommender.py](src/recommender.py) | Original scoring and ranking logic from VibeMatch 1.0 |
-| [src/main.py](src/main.py) | Command-line interface (`--ask`, `--profile`, `--experiment`) |
+| [app.py](app.py) | Streamlit web app: request box, example buttons, confidence meter, retrieved notes, per-song score breakdown |
+| [src/main.py](src/main.py) | Command-line interface (`--ask`, `--llm`, `--profile`, `--experiment`) |
 | [data/knowledge_base.json](data/knowledge_base.json) | 26 retrievable music notes |
 | [data/songs.csv](data/songs.csv) | 20-song catalog |
 | [src/evaluate.py](src/evaluate.py) | Evaluation harness: 26 labeled requests, confidence and repeatability report |
 | [docs/evaluation_results.md](docs/evaluation_results.md) | Latest evaluation results table |
-| [tests/](tests) | 22 automated tests |
+| [docs/sample_outputs.md](docs/sample_outputs.md) | Captured real output of the commands in this README, including the test run |
+| [.env.example](.env.example) | Template for the optional Gemini key (`.env` itself is git-ignored) |
+| [tests/](tests) | 33 automated tests |
 
 ## Setup Instructions
 
@@ -105,9 +113,15 @@ Requires Python 3.10 or newer. Run all commands from the project root.
    pip install -r requirements.txt
    ```
 
-   Only `pytest` is required. There are no API keys or network calls.
+   `pytest` and `streamlit` are needed for everything except the optional Gemini explanation, which also uses `google-genai`. No API key is needed to run the app.
 
-4. **Ask for recommendations**
+4. **Launch the web app** (opens in your browser at http://localhost:8501)
+
+   ```bash
+   streamlit run app.py
+   ```
+
+   Or ask from the command line:
 
    ```bash
    python -m src.main --ask "something calm for studying"
@@ -123,6 +137,13 @@ Requires Python 3.10 or newer. Run all commands from the project root.
 
    ```bash
    python -m src.evaluate
+   ```
+
+6. **Optional: Gemini-written explanations.** Copy `.env.example` to `.env`, paste your key after `GEMINI_API_KEY=`, and restart the app. Then the sidebar checkbox "Write the explanation with Gemini" becomes available (it is off by default), or you can add `--llm` on the command line. The default model is `gemini-3.5-flash-lite`; set `GEMINI_MODEL` in `.env` to change it. `.env` is git-ignored, so the key is never committed. If the key is missing or the call fails, the app uses the built-in template and says so.
+
+   ```bash
+   copy .env.example .env      # Mac or Linux: cp .env.example .env
+   python -m src.main --ask "something calm for studying" --llm
    ```
 
 Other commands: `python -m src.main` runs the six original profiles, `--profile NAME` runs one, and `--experiment weight_shift|no_mood` runs the original weight experiments. Logs are written to `logs/recommender.log`.
@@ -214,23 +235,45 @@ Confidence: 0.50 (medium)
 Note: Your request mixes very different energy levels, so I blended them; the result may satisfy neither half.
 ```
 
+### 6. Optional Gemini explanation (`--llm`)
+
+Needs `GEMINI_API_KEY` in `.env`. The ranking and scores are identical to sample 1; only the explanation changes, and its wording varies between runs.
+
+```
+$ python -m src.main --ask "something calm for studying" --llm
+
+Loaded songs: 20
+
+To help you settle into your study session, these selections match the "Studying and deep focus" note by providing steady, low-energy music that fades into the background without distracting lyrics. Tracks like *Library Rain* and *Midnight Coding* deliver the ideal lofi textures and calm moods to keep you on track. Meanwhile, ambient pieces such as *Spacewalk Thoughts* and *Drift Cloud* offer slow, floating atmospheres that are perfect for deep work and reading.
+
+Songs:
+  1. Library Rain by Paper Lanterns [lofi/chill] - score 4.93
+  2. Midnight Coding by LoRoom [lofi/chill] - score 4.71
+  3. Spacewalk Thoughts by Orbit Bloom [ambient/chill] - score 3.82
+  4. Drift Cloud by Orbit Bloom [ambient/chill] - score 3.72
+  5. Focus Flow by LoRoom [lofi/focused] - score 3.29
+
+Confidence: 1.00 (high)
+```
+
 ## Design Decisions
 
 - **RAG that drives the result.** The profile is built only from retrieved notes, so the answer is grounded in data I can read, edit and test. The song list always comes from the scorer, so the system cannot recommend a song that is not in the catalog.
 - **Reused the original scorer.** The new feature changes how the profile is created, not how songs are scored. That kept the proven, explainable scoring rule from Modules 1-3 and made it easy to tell whether a change came from retrieval or from scoring.
 - **Plain-Python TF-IDF instead of embeddings.** There is no model download, no API key and no extra dependency, and results are fully deterministic, so tests can assert exact behavior. The trade-off is that it matches words, not meaning (see Testing Summary).
-- **No generative model, on purpose.** I first built an optional Claude-written explanation and then removed it. The template already explains every pick from the retrieved notes and the score breakdown, so a language model added an API key, a network dependency, cost, prompt-injection risk and non-deterministic output, and I could not test it here. Removing it kept the project simple, reproducible and fully testable offline.
+- **Gemini explanation is optional, off by default, and cannot change the ranking.** I first built a Claude-written explanation and removed it as over-engineered, since the template already explains every pick. After adding the web app and getting a Gemini key I brought it back as a toggle. The song list always comes from the scorer, the request is passed to the model as quoted data, the model sees only the retrieved notes and the ranked songs, and any error or empty reply falls back to the template. The trade-offs are a network dependency and non-repeatable wording when it is on, which is why the default stays deterministic.
+- **Streamlit for the interface.** One short file turns the same `ask()` function the command line uses into a web app, so the GUI and the CLI cannot disagree. It shows what a reviewer needs to check the AI: the retrieved notes, the profile, the confidence and each score reason.
 - **A small hand-written knowledge base.** 26 short notes are easy to audit and fix, but they limit what the system understands. Each note carries structured hints (genre, mood, energy, acoustic) so retrieved text can directly drive the profile.
 - **Guardrails fail safe.** Bad input, no matching note, a malformed data file, and any unexpected error each produce a clear message or error result instead of a crash or a made-up answer. Every step is logged.
 - **Weighted voting for blended requests.** When several notes match, they vote by similarity. That handles "relaxing jazz for dinner" well, but it can average conflicting requests into a middle that satisfies neither half (see Testing Summary).
 
 ## Testing Summary
 
-**In short:** 22 of 22 automated tests pass. The evaluation harness passes 25 of 25 expected-to-pass requests, repeats identically 15 of 15 times, and has 1 documented known failure. Mean confidence was 0.83 on answerable requests and 0.38 on out-of-scope requests that were still answered. Adding confidence scoring fixed the main silent failure I found in manual testing.
+**In short:** 33 of 33 automated tests pass. The evaluation harness passes 25 of 25 expected-to-pass requests, repeats identically 15 of 15 times, and has 1 documented known failure. Mean confidence was 0.83 on answerable requests and 0.38 on out-of-scope requests that were still answered. Adding confidence scoring fixed the main silent failure I found in manual testing.
 
 The system is checked four ways:
 
-1. **Automated tests.** `python -m pytest` runs 22 tests ([tests/test_rag.py](tests/test_rag.py) and the original [tests/test_recommender.py](tests/test_recommender.py)): retrieval finds the right note and returns nothing for gibberish; different retrieved notes change the recommendations; answers cite their sources; results are repeatable; every guardrail rejects bad input; a corrupt knowledge base raises a clear error; and confidence behaves as intended. One test runs the whole evaluation suite as a regression check.
+1. **Automated tests.** `python -m pytest` runs 33 tests ([tests/test_rag.py](tests/test_rag.py), [tests/test_app.py](tests/test_app.py) and the original [tests/test_recommender.py](tests/test_recommender.py)): retrieval finds the right note and returns nothing for gibberish; different retrieved notes change the recommendations; answers cite their sources; results are repeatable; every guardrail rejects bad input; a corrupt knowledge base raises a clear error; confidence behaves as intended; the optional Gemini path uses the Gemini text when available, tells the model to treat the request as data, and falls back to the template on missing key, errors, timeouts and empty replies (tested with a fake model); `.env` loading never overrides real variables; and the Streamlit app loads and renders results, a no-match message and the disabled Gemini option. One test runs the whole evaluation suite as a regression check.
 2. **Confidence scoring.** Every answer ends with a score from 0 to 1: `strength x coverage`, where *strength* is how well the best note matches (similarity relative to a strong match) and *coverage* is the share of the request's words that appear anywhere in the knowledge base. Score is halved when the retrieved notes disagree about energy. Below 0.45 the answer is labeled "treat these picks with caution", and the words that weren't understood are listed.
 3. **Logging and error handling.** Requests, retrieved notes, profiles, low-confidence warnings and exceptions are written to `logs/recommender.log`. Every failure path returns a message or an error result instead of crashing.
 4. **Evaluation harness.** `python -m src.evaluate` runs 26 labeled requests through the real pipeline and writes [docs/evaluation_results.md](docs/evaluation_results.md), a table with each input, criteria, result and confidence.
@@ -251,6 +294,7 @@ The system is checked four ways:
 - **Confidence is conservative.** "Feeling confident getting ready to go out" retrieved exactly the right note and a hip hop song, yet scored only 0.33 because several of its words aren't in the notes. A correct answer can look unsure.
 - **Confidence can't catch everything.** "Chill beats for a rainy afternoon" returned jazz at 0.64 (medium). I accepted jazz or lofi there, since both fit, but the user may have wanted lofi.
 - **The evaluation set is not independent.** I wrote it after trying many requests by hand, so a 25 of 25 pass rate overstates how well it would do on a stranger's requests. It is a regression check and a demonstration, not an unbiased accuracy estimate. A fair measurement needs requests collected from other people.
+- **Gemini was checked live only lightly.** I ran the Gemini path against the real API (sample 6 above) and it works, but only a handful of requests, and I did not evaluate the wording systematically. Two things surfaced that tests with a stand-in could not: the originally chosen model (`gemini-2.5-flash`) was retired for new accounts, and `gemini-3.8-flash` hit a 45-second server timeout on this prompt, so the default is now `gemini-3.5-flash-lite` (about 1 second). Models change quickly; override with `GEMINI_MODEL` in `.env` if the default stops working. Gemini output also varies from run to run, unlike the template.
 
 The main lesson is that tests prove the system is repeatable and safe, but a system also has to know when it might be wrong. The most useful bugs came from typing requests I hadn't designed for, and the most useful fix was making the system admit uncertainty.
 

@@ -1,6 +1,6 @@
 # Reproducible Execution Evidence
 
-Real output captured by running each command from the project root on Python 3.12.4. Regenerate any block by re-running its command; the recommendations are deterministic. The full evaluation table is in [evaluation_results.md](evaluation_results.md) (`python -m src.evaluate`).
+Real output captured by running each command from the project root on Python 3.12.4. Regenerate any block by re-running its command; the recommendations are deterministic (the optional Gemini explanation is off in these runs). The full evaluation table is in [evaluation_results.md](evaluation_results.md) (`python -m src.evaluate`).
 
 ## `python -m src.main --ask "something calm for studying"`
 
@@ -202,9 +202,28 @@ Top recommendations:
    - acoustic fit (+0.08)
 ```
 
+## `python -m src.main --ask "something calm for studying" --llm`
+
+Requires `GEMINI_API_KEY` in `.env`. The explanation text varies between runs; the songs and scores do not.
+
+```
+Loaded songs: 20
+
+To help you settle into your study session, these selections match the "Studying and deep focus" note by providing steady, low-energy music that fades into the background without distracting lyrics. Tracks like *Library Rain* and *Midnight Coding* deliver the ideal lofi textures and calm moods to keep you on track. Meanwhile, ambient pieces such as *Spacewalk Thoughts* and *Drift Cloud* offer slow, floating atmospheres that are perfect for deep work and reading.
+
+Songs:
+  1. Library Rain by Paper Lanterns [lofi/chill] - score 4.93
+  2. Midnight Coding by LoRoom [lofi/chill] - score 4.71
+  3. Spacewalk Thoughts by Orbit Bloom [ambient/chill] - score 3.82
+  4. Drift Cloud by Orbit Bloom [ambient/chill] - score 3.72
+  5. Focus Flow by LoRoom [lofi/focused] - score 3.29
+
+Confidence: 1.00 (high)
+```
+
 ## `python -m pytest -q`
 
 ```
-......................                                                   [100%]
-22 passed in 0.08s
+.................................                                        [100%]
+33 passed in 1.91s
 ```

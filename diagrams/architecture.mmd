@@ -1,12 +1,13 @@
 flowchart TD
-    User([Listener]) -->|"free-text request"| Guard
+    User([Listener]) -->|"free-text request"| UI["Streamlit app (app.py)<br/>or command line (src/main.py)"]
+    UI --> Guard
 
     subgraph PIPE["RAG pipeline (src/rag.py + src/recommender.py)"]
         Guard{"1. Guardrails<br/>text, 3-300 chars, has letters?"}
         Retriever["2. Retriever<br/>TF-IDF + cosine similarity"]
         Profile["3. Profile builder<br/>retrieved notes vote on genre, mood,<br/>energy, acoustic preference"]
         Scorer["4. Scorer<br/>energy + mood + genre + acoustic<br/>max 5.0 points"]
-        Generate["5. Answer generator + confidence score<br/>deterministic template<br/>cites notes and score reasons"]
+        Generate["5. Answer generator + confidence score<br/>template by default,<br/>cites notes and score reasons"]
         Guard -->|valid| Retriever --> Profile --> Scorer --> Generate
     end
 
@@ -15,12 +16,15 @@ flowchart TD
 
     Guard -->|invalid| Msg["Friendly message"]
     Retriever -->|"no matching note"| Msg
-    Msg --> User
+    Msg --> UI
+    Gemini(["Gemini API<br/>optional, off by default,<br/>falls back to template"])
+    Generate <-.->|"optional explanation"| Gemini
     Generate --> Answer["Answer: cited notes,<br/>profile, top 5 songs with reasons"]
-    Answer --> User
+    Answer --> UI
+    UI --> User
 
     subgraph CHECKS["Testing and human oversight"]
-        Tests["pytest suite<br/>retrieval, determinism,<br/>guardrails, confidence"]
+        Tests["pytest suite<br/>retrieval, determinism,<br/>guardrails, confidence,<br/>mocked Gemini, GUI"]
         Eval["Evaluation harness (src/evaluate.py)<br/>26 labeled requests, pass/fail,<br/>confidence, repeatability"]
         Log[("logs/recommender.log")]
         Human["Human reviewer<br/>reads cited sources and score reasons,<br/>checks the log"]

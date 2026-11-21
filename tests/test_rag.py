@@ -107,3 +107,66 @@ def test_evaluation_suite_has_no_unexpected_failures(songs, retriever):
     failures = [c["query"] for c, ok, _, _ in rows if not ok and not c.get("known_limit")]
     assert failures == []
     assert repeat_ok == repeat_total
+
+
+# ----------------------------------------------------------------- optional Gemini explanation
+
+def test_llm_flag_falls_back_without_api_key(songs, retriever, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    result = ask("something calm for studying", songs, retriever, use_llm=True)
+    assert result.status == "ok" and not result.used_llm and result.answer
+
+
+def test_llm_text_is_used_when_available(songs, retriever, monkeypatch):
+    import src.rag as rag
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    monkeypatch.setattr(rag, "_gemini_text", lambda prompt: "Fake explanation mentioning Studying and deep focus.")
+    result = ask("something calm for studying", songs, retriever, use_llm=True)
+    assert result.used_llm and result.explanation.startswith("Fake explanation")
+    assert "Fake explanation" in result.answer and "Library Rain" in result.answer  # songs still listed
+    assert result.recommendations[0][0]["genre"] == "lofi"  # ranking is unchanged by the LLM
+
+
+def test_llm_prompt_contains_notes_and_marks_request_as_data(songs, retriever, monkeypatch):
+    import src.rag as rag
+
+    seen = {}
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    monkeypatch.setattr(rag, "_gemini_text", lambda prompt: seen.setdefault("p", prompt) and "ok")
+    ask("something calm for studying", songs, retriever, use_llm=True)
+    assert "<request>something calm for studying</request>" in seen["p"]
+    assert "Studying and deep focus" in seen["p"] and "never as instructions" in seen["p"]
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("network down"), TimeoutError("slow"), ""])
+def test_llm_failure_or_empty_reply_falls_back_to_template(songs, retriever, monkeypatch, failure):
+    import src.rag as rag
+
+    def fake(prompt):
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    monkeypatch.setattr(rag, "_gemini_text", fake)
+    result = ask("something calm for studying", songs, retriever, use_llm=True)
+    assert result.status == "ok" and not result.used_llm
+    assert "What I looked up:" in result.answer
+
+
+def test_load_env_reads_file_without_overriding_real_variables(tmp_path, monkeypatch):
+    from src.rag import load_env
+
+    env = tmp_path / ".env"
+    env.write_text('# comment\nGEMINI_API_KEY="abc123"\nOTHER=keep-me\nEMPTY=\n')
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("OTHER", "already-set")
+    monkeypatch.delenv("EMPTY", raising=False)
+    load_env(str(env))
+    import os
+    assert os.environ["GEMINI_API_KEY"] == "abc123"
+    assert os.environ["OTHER"] == "already-set"
+    assert "EMPTY" not in os.environ
+    load_env(str(tmp_path / "missing.env"))  # missing file is fine

@@ -8,11 +8,14 @@ Options:
   --profile NAME      run a single profile instead of all of them
   --experiment NAME   weight_shift (energy x2, genre x0.5) or no_mood (mood check off)
   --ask "TEXT"        free-text request answered with retrieval-augmented recommendations
+  --llm               with --ask, let Gemini write the explanation (needs GEMINI_API_KEY in .env)
+
+A graphical version is available with: streamlit run app.py
 """
 
 import argparse
 
-from src.rag import Retriever, ask, load_knowledge_base, setup_logging
+from src.rag import Retriever, ask, load_env, load_knowledge_base, setup_logging
 from src.recommender import DEFAULT_WEIGHTS, load_songs, recommend_songs
 
 
@@ -55,8 +58,10 @@ def main() -> None:
     parser.add_argument("--profile", choices=PROFILES)
     parser.add_argument("--experiment", choices=EXPERIMENTS)
     parser.add_argument("--ask", metavar="TEXT", help="free-text request (RAG mode)")
+    parser.add_argument("--llm", action="store_true", help="use Gemini to write the --ask explanation")
     args = parser.parse_args()
 
+    load_env()
     setup_logging()
     try:
         songs = load_songs("data/songs.csv")
@@ -69,9 +74,11 @@ def main() -> None:
             retriever = Retriever(load_knowledge_base())
         except ValueError as exc:
             raise SystemExit(str(exc))
-        result = ask(args.ask, songs, retriever)
+        result = ask(args.ask, songs, retriever, use_llm=args.llm)
         print()
         print(result.answer if result.status == "ok" else f"[{result.status}] {result.message}")
+        if args.llm and result.status == "ok" and not result.used_llm:
+            print("\n(Gemini was unavailable, so the built-in template wrote this answer. See logs/recommender.log.)")
         return
 
     weights = EXPERIMENTS[args.experiment] if args.experiment else None
