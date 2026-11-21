@@ -1,0 +1,32 @@
+flowchart TD
+    User([Listener]) -->|"free-text request"| Guard
+
+    subgraph PIPE["RAG pipeline (src/rag.py + src/recommender.py)"]
+        Guard{"1. Guardrails<br/>text, 3-300 chars, has letters?"}
+        Retriever["2. Retriever<br/>TF-IDF + cosine similarity"]
+        Profile["3. Profile builder<br/>retrieved notes vote on genre, mood,<br/>energy, acoustic preference"]
+        Scorer["4. Scorer<br/>energy + mood + genre + acoustic<br/>max 5.0 points"]
+        Generate["5. Answer generator<br/>Claude if --llm and key works,<br/>otherwise template"]
+        Guard -->|valid| Retriever --> Profile --> Scorer --> Generate
+    end
+
+    KB[("Knowledge base<br/>26 notes")] --> Retriever
+    Catalog[("Song catalog<br/>20 songs")] --> Scorer
+
+    Guard -->|invalid| Msg["Friendly message"]
+    Retriever -->|"no matching note"| Msg
+    Msg --> User
+    Generate --> Answer["Answer: cited notes,<br/>profile, top 5 songs with reasons"]
+    Answer --> User
+
+    subgraph CHECKS["Testing and human oversight"]
+        Tests["pytest suite<br/>retrieval, determinism,<br/>guardrails, LLM fallback"]
+        Log[("logs/recommender.log")]
+        Human["Human reviewer<br/>reads cited sources and score reasons,<br/>checks the log"]
+    end
+
+    Tests -.->|verifies| PIPE
+    PIPE -.->|"logs every step"| Log
+    Answer --> Human
+    Log --> Human
+    Human -.->|"edits notes, weights, tests"| KB

@@ -1,17 +1,55 @@
-# 🎵 Music Recommender Simulation
+# 🎵 VibeMatch 2.0: Music Recommender with Retrieval-Augmented Generation
 
 ## Project Summary
 
-In this project you will build and explain a small music recommender system.
+VibeMatch started as a small command-line music recommender (Modules 1-3). It loads 20 made-up songs from `data/songs.csv`, compares each song to a taste profile (favorite genre, favorite mood, target energy, whether the listener likes acoustic music), scores every song out of 5, and prints the top 5 with a reason for every point awarded. The original evaluation (six stress-test profiles and two weight experiments) is in the [Model Card](model_card.md).
 
-Your goal is to:
+**VibeMatch 2.0 adds a Retrieval-Augmented Generation (RAG) feature.** Instead of hand-writing a profile, you type a request such as `"something calm for studying"`. The system retrieves matching notes from a small music knowledge base, builds the taste profile **from those notes**, runs the original scorer, and explains its picks by citing the notes it used. It includes input guardrails, logging and an automated test suite. See [AI Feature: RAG](#ai-feature-retrieval-augmented-generation-rag).
 
-- Represent songs and a user "taste profile" as data
-- Design a scoring rule that turns that data into recommendations
-- Evaluate what your system gets right and wrong
-- Reflect on how this mirrors real world AI recommenders
+```bash
+python -m src.main --ask "something calm for studying"
+```
 
-**VibeMatch 1.0** is a small command-line recommender. It loads 20 made-up songs from `data/songs.csv`, compares each song to a user's taste profile (favorite genre, favorite mood, target energy, and whether they like acoustic music), and gives every song a score out of 5. It then ranks the songs and prints the top 5, with a reason for every point awarded. I tested it on six profiles, ran two experiments that change the weights, and wrote down where it works and where it fails in the [Model Card](model_card.md).
+## System Architecture
+
+The diagram below is rendered from [diagrams/architecture.mmd](diagrams/architecture.mmd). A static export is also in [assets/architecture.png](assets/architecture.png).
+
+```mermaid
+flowchart TD
+    User([Listener]) -->|"free-text request"| Guard
+
+    subgraph PIPE["RAG pipeline (src/rag.py + src/recommender.py)"]
+        Guard{"1. Guardrails<br/>text, 3-300 chars, has letters?"}
+        Retriever["2. Retriever<br/>TF-IDF + cosine similarity"]
+        Profile["3. Profile builder<br/>retrieved notes vote on genre, mood,<br/>energy, acoustic preference"]
+        Scorer["4. Scorer<br/>energy + mood + genre + acoustic<br/>max 5.0 points"]
+        Generate["5. Answer generator<br/>Claude if --llm and key works,<br/>otherwise template"]
+        Guard -->|valid| Retriever --> Profile --> Scorer --> Generate
+    end
+
+    KB[("Knowledge base<br/>26 notes")] --> Retriever
+    Catalog[("Song catalog<br/>20 songs")] --> Scorer
+
+    Guard -->|invalid| Msg["Friendly message"]
+    Retriever -->|"no matching note"| Msg
+    Msg --> User
+    Generate --> Answer["Answer: cited notes,<br/>profile, top 5 songs with reasons"]
+    Answer --> User
+
+    subgraph CHECKS["Testing and human oversight"]
+        Tests["pytest suite<br/>retrieval, determinism,<br/>guardrails, LLM fallback"]
+        Log[("logs/recommender.log")]
+        Human["Human reviewer<br/>reads cited sources and score reasons,<br/>checks the log"]
+    end
+
+    Tests -.->|verifies| PIPE
+    PIPE -.->|"logs every step"| Log
+    Answer --> Human
+    Log --> Human
+    Human -.->|"edits notes, weights, tests"| KB
+```
+
+**Where checking happens:** the guardrails reject bad input before anything runs; the `pytest` suite verifies the retriever, scorer, guardrails and fallback; every step is logged; and a human reviewer can read the cited notes and per-song score reasons for each answer, check the log, and correct the knowledge base or weights.
 
 ---
 
@@ -27,7 +65,7 @@ Every recommender has three parts, and it helps to keep them separate:
 
 Platforms blend two main ideas. **Collaborative filtering** uses other users' behavior and recommends what similar listeners enjoyed, so it needs no knowledge of the song itself. **Content-based filtering** uses song attributes and recommends songs that resemble what you already like. Collaborative filtering finds surprising picks but struggles with brand-new songs (the "cold start" problem); content-based handles new songs well but can trap you in a bubble of near-duplicates. Modern systems also learn from implicit feedback (a skip in the first 30 seconds is a strong "no") and try to optimize for satisfaction, such as watch time, instead of just clicks.
 
-My version is purely **content-based**: with 10 songs and one user at a time there is no crowd to learn from. It prioritizes **how close a song's energy is to what the user wants**, then **mood**, then **genre**. Mood and energy capture how a song *feels*, while genre is a coarse label that, in this catalog, matches only one to three songs.
+My version is purely **content-based**: with 20 songs and one user at a time there is no crowd to learn from. It prioritizes **how close a song's energy is to what the user wants**, then **mood**, then **genre**. Mood and energy capture how a song *feels*, while genre is a coarse label that, in this catalog, matches only one to three songs.
 
 ### Features
 
