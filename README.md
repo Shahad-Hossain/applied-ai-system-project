@@ -129,7 +129,7 @@ Other commands: `python -m src.main` runs the six original profiles, `--profile 
 
 ## Sample Interactions
 
-Outputs are from the real program (top picks shown; the full output lists 5 songs).
+Outputs are from the real program (top picks shown; the full output lists 5 songs). Complete, unabridged outputs are saved in [docs/sample_outputs.md](docs/sample_outputs.md).
 
 ### 1. A calm studying request
 
@@ -265,4 +265,5 @@ My full responsible-AI reflection (how I collaborated with AI, a suggestion I ac
 - [Model Card](model_card.md): intended use, biases, evaluation and responsible-AI reflection
 - [docs/original_project.md](docs/original_project.md): full VibeMatch 1.0 write-up, stress tests and weight experiments
 - [docs/evaluation_results.md](docs/evaluation_results.md): latest evaluation results table
+- [docs/sample_outputs.md](docs/sample_outputs.md): raw captured output of the commands above, including the test run
 - [diagrams/architecture.mmd](diagrams/architecture.mmd): architecture diagram source (Mermaid)
