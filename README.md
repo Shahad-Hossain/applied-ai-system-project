@@ -1,18 +1,26 @@
-# 🎵 VibeMatch 2.0: Music Recommender with Retrieval-Augmented Generation
+# 🎵 VibeMatch 2.0: A Music Recommender with Retrieval-Augmented Generation
 
-## Project Summary
-
-VibeMatch started as a small command-line music recommender (Modules 1-3). It loads 20 made-up songs from `data/songs.csv`, compares each song to a taste profile (favorite genre, favorite mood, target energy, whether the listener likes acoustic music), scores every song out of 5, and prints the top 5 with a reason for every point awarded. The original evaluation (six stress-test profiles and two weight experiments) is in the [Model Card](model_card.md).
-
-**VibeMatch 2.0 adds a Retrieval-Augmented Generation (RAG) feature.** Instead of hand-writing a profile, you type a request such as `"something calm for studying"`. The system retrieves matching notes from a small music knowledge base, builds the taste profile **from those notes**, runs the original scorer, and explains its picks by citing the notes it used. It includes input guardrails, logging and an automated test suite. See [AI Feature: RAG](#ai-feature-retrieval-augmented-generation-rag).
+Describe what you want to listen to in plain English, and VibeMatch looks up music knowledge, turns it into a taste profile, and recommends songs with a cited explanation for every pick.
 
 ```bash
 python -m src.main --ask "something calm for studying"
 ```
 
-## System Architecture
+## Original Project (Modules 1-3)
 
-The diagram below is rendered from [diagrams/architecture.mmd](diagrams/architecture.mmd). A static export is also in [assets/architecture.png](assets/architecture.png).
+This project extends **VibeMatch 1.0, the "Music Recommender Simulation"** from Modules 1-3. VibeMatch 1.0 was a small command-line, content-based recommender. It loaded 20 made-up songs, compared each one to a hand-written taste profile (favorite genre, favorite mood, target energy, acoustic preference), scored every song out of 5 points, and printed the top 5 with a reason for every point awarded. I stress-tested it on six profiles and two weight experiments and documented where it failed. That work is preserved in [docs/original_project.md](docs/original_project.md) and the [Model Card](model_card.md).
+
+## Title and Summary
+
+**VibeMatch 2.0** removes the biggest weakness of version 1.0: a user had to already know their own profile in the system's vocabulary (`genre=lofi, mood=chill, energy=0.38`). Now a listener can type "something calm for studying" or "music for a late night drive".
+
+The system uses **Retrieval-Augmented Generation (RAG)**. It retrieves the most relevant notes from a small music knowledge base, builds the taste profile **only from those notes**, scores the song catalog with the original scoring rule, and writes an answer that cites the notes it used. It also has input guardrails, logging, and an automated test suite.
+
+**Why it matters:** recommenders that cannot explain themselves are hard to trust or debug. Here every recommendation can be traced back to a retrieved source and an itemized score, so a person can check the AI's reasoning instead of taking it on faith.
+
+## Architecture Overview
+
+The diagram is rendered from [diagrams/architecture.mmd](diagrams/architecture.mmd), and a static export is in [assets/architecture.png](assets/architecture.png).
 
 ```mermaid
 flowchart TD
@@ -49,478 +57,187 @@ flowchart TD
     Human -.->|"edits notes, weights, tests"| KB
 ```
 
-**Where checking happens:** the guardrails reject bad input before anything runs; the `pytest` suite verifies the retriever, scorer, guardrails and fallback; every step is logged; and a human reviewer can read the cited notes and per-song score reasons for each answer, check the log, and correct the knowledge base or weights.
+**How data flows (input → process → output):**
 
----
+1. **Guardrails** check the request is text, 3-300 characters, and contains letters. Bad input gets a friendly message and nothing else runs.
+2. **Retriever** ranks the 26 notes in [data/knowledge_base.json](data/knowledge_base.json) (activities, genres, moods) against the request using TF-IDF cosine similarity. If no note is similar enough, the system says so instead of guessing.
+3. **Profile builder** lets the top 3 notes vote, weighted by similarity, on genre, mood, target energy and acoustic preference. Genres and moods the catalog doesn't have are ignored.
+4. **Scorer** is the original VibeMatch 1.0 rule (energy closeness 2.0, mood 1.5, genre 1.0, acoustic fit 0.5) applied to the 20-song catalog.
+5. **Answer generator** writes the answer, citing the retrieved notes and the per-song score breakdown. With `--llm`, Claude writes the explanation from the retrieved notes; if that is unavailable it falls back to a deterministic template.
 
-## How The System Works
+**Where people and tests check the AI:** the `pytest` suite verifies each stage, every step is logged to `logs/recommender.log`, and a human reviewer can read the cited sources and score reasons on each answer and then fix the knowledge base, weights or tests.
 
-### How real-world recommenders work
-
-Every recommender has three parts, and it helps to keep them separate:
-
-1. **Input data.** What the system knows. For songs, that is features like genre, mood, tempo, energy and acousticness. For users, it is their history: plays, skips, saves, likes and playlist adds, plus context like time of day.
-2. **User preferences.** What the system believes this person wants. Real platforms learn it from history (for example, "this user skips slow songs and replays upbeat pop"). In my version, I write it down by hand as a taste profile.
-3. **Ranking and selection.** The system scores every candidate song against the preferences, sorts by score, and shows only the top few. Platforms like Spotify and YouTube do this in two steps: first they narrow millions of items to a few hundred candidates, then a heavier model ranks those.
-
-Platforms blend two main ideas. **Collaborative filtering** uses other users' behavior and recommends what similar listeners enjoyed, so it needs no knowledge of the song itself. **Content-based filtering** uses song attributes and recommends songs that resemble what you already like. Collaborative filtering finds surprising picks but struggles with brand-new songs (the "cold start" problem); content-based handles new songs well but can trap you in a bubble of near-duplicates. Modern systems also learn from implicit feedback (a skip in the first 30 seconds is a strong "no") and try to optimize for satisfaction, such as watch time, instead of just clicks.
-
-My version is purely **content-based**: with 20 songs and one user at a time there is no crowd to learn from. It prioritizes **how close a song's energy is to what the user wants**, then **mood**, then **genre**. Mood and energy capture how a song *feels*, while genre is a coarse label that, in this catalog, matches only one to three songs.
-
-### Features
-
-**`Song`** (from `data/songs.csv`): `id`, `title`, `artist`, `genre`, `mood`, `energy`, `tempo_bpm`, `valence`, `danceability`, `acousticness`. Only `genre`, `mood`, `energy` and `acousticness` are used in scoring. `tempo_bpm`, `danceability` and `valence` are loaded but left out, because they largely repeat what `energy` already says (high-energy songs here are also fast and danceable).
-
-**`UserProfile`**: `favorite_genre`, `favorite_mood`, `target_energy` (0.0 to 1.0) and `likes_acoustic` (bool).
-
-### Algorithm Recipe (the Scoring Rule)
-
-Each song gets a score from 0 to 5.0 points, the sum of four parts:
-
-| Part | Max points | How it is computed |
-|---|---|---|
-| Energy closeness | 2.0 | `2.0 * (1 - abs(song.energy - user.target_energy))` |
-| Mood match | 1.5 | `+1.5` if `song.mood == favorite_mood`, else `0` |
-| Genre match | 1.0 | `+1.0` if `song.genre == favorite_genre`, else `0` |
-| Acoustic fit | 0.5 | `0.5 * song.acousticness` if `likes_acoustic`, else `0.5 * (1 - song.acousticness)` |
-
-**Why not "+2.0 genre, +1.0 mood"?** I tried that common starting point against the 20-song catalog and it let genre override everything else. A chill, acoustic rock fan (energy 0.40) was recommended Crimson Highway and Storm Runner, both loud rock tracks, ahead of every quiet song. A happy-pop fan got Gym Hero (an intense workout track) above Rooftop Lights (a happy indie-pop song). With genre at 1.0 and energy and mood carrying more weight, the rankings follow how a song feels, and genre acts as a bonus.
-
-**Why closeness, not "higher is better":** a user who wants `energy = 0.4` should not be pushed toward a 0.9 song just because 0.9 is bigger. Taking the absolute distance and subtracting it from 1 gives full credit for an exact match and less credit the further the song drifts in either direction.
-
-**Why mood outweighs genre:** mood describes the listening experience across genres (a "chill" lofi and a "chill" ambient track fit the same moment), while genre is a coarse label. Even in the 20-song catalog most genres have only one to three songs, so an exact genre match is a rare yes/no switch and should not dominate.
-
-### Ranking Rule
-
-The scoring rule judges **one song at a time** and knows nothing about the others. The ranking rule works on the **whole list**: it scores every song, sorts by score from highest to lowest, and returns the top `k`. Both are needed because a score alone is just a number, and a sorted list alone has nothing to sort by. Keeping them separate also means I can change the weights without touching the sorting, or change how many results to return without touching the scoring.
-
-### Dataset and example profiles
-
-`data/songs.csv` has 20 songs across 10 genres and 12 moods, with energy from 0.22 to 0.96 and valence from 0.22 to 0.84. The songs were expanded to fill gaps in the original 10 (no mid-energy songs, no sad songs, no acoustic-and-upbeat songs). Profiles are dictionaries in `src/main.py`, for example:
-
-```python
-{"genre": "lofi", "mood": "chill", "energy": 0.38, "likes_acoustic": True}   # chill lofi
-{"genre": "rock", "mood": "intense", "energy": 0.92, "likes_acoustic": False} # intense rock
-```
-
-In a trial run of the recipe these two profiles shared no songs in their top 4, so the profile is specific enough to tell them apart.
-
-### Expected biases and limitations
-
-- **Energy can outvote genre.** Energy and acoustic fit together are worth up to 2.5 of 5.0 points, so a user who wants rock but at low energy may get no rock at all. In a trial, a "mellow rock" profile received only quiet lofi and ambient songs.
-- **Genre can still pull in the wrong song.** A genre match is a flat +1.0 even when the song feels different, and mood matching is all-or-nothing. A pop fan can be shown Gym Hero (an intense pop track), while `angry` rock gets no mood credit for an `intense` rock fan.
-- **Exact string matching treats near-genres as total misses.** `indie pop` earns nothing for a `pop` fan.
-- **Mood vocabulary favors common moods.** `chill` appears 4 times and `happy` 3 times, while most moods appear once, so users who prefer rarer moods get fewer good candidates.
-- **One favorite per category.** A profile holds one genre and one mood, so someone who likes both lofi and jazz can't be represented.
-- **No diversity or discovery.** Songs are scored independently, so the top results may all sound alike, and there is no collaborative signal to surface surprising picks.
-- **Tiny, hand-made catalog.** The songs are invented and the weights can only be judged by whether rankings look sensible, not validated statistically.
-
----
-
-## Getting Started
-
-### Setup
-
-Requires Python 3.10+. Run everything from the project root.
-
-```bash
-python -m venv .venv
-source .venv/bin/activate      # Mac or Linux
-.venv\Scripts\activate         # Windows
-pip install -r requirements.txt
-```
-
-Run the original profile demo (no AI request, no network):
-
-```bash
-python -m src.main
-```
-
-Run the AI feature, a free-text request answered with retrieval-augmented recommendations:
-
-```bash
-python -m src.main --ask "something calm for studying"
-```
-
-Optional: let Claude write the explanation instead of the built-in template. This is the only part that needs a network connection or an API key; if the key is missing or the call fails, the app falls back to the template automatically.
-
-```bash
-export ANTHROPIC_API_KEY=your-key      # Windows PowerShell: $env:ANTHROPIC_API_KEY = "your-key"
-python -m src.main --ask "something calm for studying" --llm
-```
-
-### Running Tests
-
-```bash
-python -m pytest
-```
-
----
-
-## AI Feature: Retrieval-Augmented Generation (RAG)
-
-`--ask` takes a plain-English request instead of a hand-written profile. The code is in [src/rag.py](src/rag.py) and it is part of the main recommendation path, not a separate script:
-
-1. **Guardrails** check the request (must be text, 3 to 300 characters, contain letters).
-2. **Retrieve**: the request is matched against a knowledge base of 26 short notes in [data/knowledge_base.json](data/knowledge_base.json) (activities like studying or working out, genres, and moods) using TF-IDF cosine similarity. It is written in plain Python, so there is nothing extra to install.
-3. **Augment**: the top matching notes vote on the taste profile (genre, mood, target energy, acoustic preference). The profile is built **only** from the retrieved notes, so a different request retrieves different notes and gets different songs. For example, "calm for studying" retrieves the *Studying* note and returns lofi at energy 0.35, while "pump-up songs for the gym" retrieves the *Workout* note and returns EDM at energy 0.91.
-4. **Recommend**: the profile goes through the same scoring rule as before.
-5. **Generate**: the answer cites the notes it used and lists the score breakdown for each song. With `--llm`, Claude writes the explanation from the retrieved notes and ranked songs, and is told not to invent facts.
-
-### Reliability and safety
-
-- **Logging**: every request, the notes retrieved, the profile built and the top pick are written to `logs/recommender.log` (git-ignored).
-- **Bad input**: empty, too short, too long, non-text or word-free requests are rejected with a message instead of crashing.
-- **No match**: a request the knowledge base can't relate to (for example `asdfgh qwerty`) returns example requests, not random songs.
-- **Failures**: a missing or malformed data file stops with a clear error; any failure inside the pipeline returns an error result and is logged; any Claude failure falls back to the template.
-- **Tests**: [tests/test_rag.py](tests/test_rag.py) checks that retrieval finds the right note, that different notes change the recommendations, that answers cite their sources, that results are repeatable, and that every guardrail works.
-
-### Known limits of the RAG feature
-
-The knowledge base is small and hand-written, so the vocabulary it understands is limited. Retrieval matches words, not meaning, so a request using none of the words in the notes returns `no_match`. The `--llm` path has not been exercised against the live API in this repository's tests.
-
----
-
-## Sample Recommendation Output
-
-Output of `python -m src.main` for the default `pop_happy` profile:
-
-```
-Loaded songs: 20
-
-Profile: pop_happy {'genre': 'pop', 'mood': 'happy', 'energy': 0.8, 'likes_acoustic': False}
-Top recommendations:
-
-1. Sunrise City by Neon Echo
-   Score: 4.87 / 5.00
-   - genre match (+1.0)
-   - mood match (+1.5)
-   - energy 0.82 vs target 0.80 (+1.96)
-   - acoustic fit (+0.41)
-
-2. Rooftop Lights by Indigo Parade
-   Score: 3.75 / 5.00
-   - mood match (+1.5)
-   - energy 0.76 vs target 0.80 (+1.92)
-   - acoustic fit (+0.33)
-
-3. Gym Hero by Max Pulse
-   Score: 3.22 / 5.00
-   - genre match (+1.0)
-   - energy 0.93 vs target 0.80 (+1.74)
-   - acoustic fit (+0.47)
-
-4. Heartbeat Replay by Neon Echo
-   Score: 3.05 / 5.00
-   - genre match (+1.0)
-   - energy 0.65 vs target 0.80 (+1.70)
-   - acoustic fit (+0.35)
-
-5. Dandelion Fields by Paper Lanterns
-   Score: 3.02 / 5.00
-   - mood match (+1.5)
-   - energy 0.52 vs target 0.80 (+1.44)
-   - acoustic fit (+0.08)
-```
-
-### Why these songs were recommended
-
-Each explanation below comes straight from the score breakdown above.
-
-- **Sunrise City (4.87 / 5), Happy Pop:** it is a pop song (+1.0 genre), its mood is happy (+1.5 mood), its energy of 0.82 is almost exactly the 0.80 target (+1.96 energy), and it is not very acoustic (+0.41). It matches on everything, so it wins.
-- **Rooftop Lights (3.75 / 5), Happy Pop:** it is happy (+1.5) and has energy 0.76, close to the target (+1.92). It gets no genre points because it is "indie pop", not "pop". That one missing point is why it is second.
-- **Gym Hero (3.22 / 5), Happy Pop:** it is a pop song (+1.0) with energy 0.93 (+1.74), but its mood is "intense", not "happy", so it earns no mood points. It ranks third only because there are few better options.
-- **Storm Runner (4.93 / 5), Deep Intense Rock:** rock genre (+1.0), intense mood (+1.5), energy 0.91 against a 0.92 target (+1.98), and low acousticness (+0.45). It is a near-perfect match.
-- **Library Rain (4.87 / 5), Chill Lofi:** lofi genre (+1.0), chill mood (+1.5), energy 0.35 against 0.38 (+1.94), and it is very acoustic, which this user likes (+0.43).
-
-**Screenshot or video** *(optional)*: <!-- Insert a screenshot or demo video link here -->
-
----
-
-## Stress Test: Diverse Profiles
-
-Output of `python -m src.main` (all six profiles; run one with `--profile NAME`). The first three are everyday users, the last three are adversarial profiles designed to trick the scoring.
-
-### Happy Pop (normal)
-
-```
-Profile: pop_happy {'genre': 'pop', 'mood': 'happy', 'energy': 0.8, 'likes_acoustic': False}
-Top recommendations:
-
-1. Sunrise City by Neon Echo [pop/happy]
-   Score: 4.87 / 5.00
-   - genre match (+1.0)
-   - mood match (+1.5)
-   - energy 0.82 vs target 0.80 (+1.96)
-   - acoustic fit (+0.41)
-
-2. Rooftop Lights by Indigo Parade [indie pop/happy]
-   Score: 3.75 / 5.00
-   - mood match (+1.5)
-   - energy 0.76 vs target 0.80 (+1.92)
-   - acoustic fit (+0.33)
-
-3. Gym Hero by Max Pulse [pop/intense]
-   Score: 3.22 / 5.00
-   - genre match (+1.0)
-   - energy 0.93 vs target 0.80 (+1.74)
-   - acoustic fit (+0.47)
-
-4. Heartbeat Replay by Neon Echo [pop/romantic]
-   Score: 3.05 / 5.00
-   - genre match (+1.0)
-   - energy 0.65 vs target 0.80 (+1.70)
-   - acoustic fit (+0.35)
-
-5. Dandelion Fields by Paper Lanterns [folk/happy]
-   Score: 3.02 / 5.00
-   - mood match (+1.5)
-   - energy 0.52 vs target 0.80 (+1.44)
-   - acoustic fit (+0.08)
-```
-
-### Chill Lofi (normal)
-
-```
-Profile: chill_lofi {'genre': 'lofi', 'mood': 'chill', 'energy': 0.38, 'likes_acoustic': True}
-Top recommendations:
-
-1. Library Rain by Paper Lanterns [lofi/chill]
-   Score: 4.87 / 5.00
-   - genre match (+1.0)
-   - mood match (+1.5)
-   - energy 0.35 vs target 0.38 (+1.94)
-   - acoustic fit (+0.43)
-
-2. Midnight Coding by LoRoom [lofi/chill]
-   Score: 4.78 / 5.00
-   - genre match (+1.0)
-   - mood match (+1.5)
-   - energy 0.42 vs target 0.38 (+1.92)
-   - acoustic fit (+0.35)
-
-3. Spacewalk Thoughts by Orbit Bloom [ambient/chill]
-   Score: 3.76 / 5.00
-   - mood match (+1.5)
-   - energy 0.28 vs target 0.38 (+1.80)
-   - acoustic fit (+0.46)
-
-4. Drift Cloud by Orbit Bloom [ambient/chill]
-   Score: 3.65 / 5.00
-   - mood match (+1.5)
-   - energy 0.22 vs target 0.38 (+1.68)
-   - acoustic fit (+0.47)
-
-5. Focus Flow by LoRoom [lofi/focused]
-   Score: 3.35 / 5.00
-   - genre match (+1.0)
-   - energy 0.40 vs target 0.38 (+1.96)
-   - acoustic fit (+0.39)
-```
-
-### Deep Intense Rock (normal)
-
-```
-Profile: intense_rock {'genre': 'rock', 'mood': 'intense', 'energy': 0.92, 'likes_acoustic': False}
-Top recommendations:
-
-1. Storm Runner by Voltline [rock/intense]
-   Score: 4.93 / 5.00
-   - genre match (+1.0)
-   - mood match (+1.5)
-   - energy 0.91 vs target 0.92 (+1.98)
-   - acoustic fit (+0.45)
-
-2. Gym Hero by Max Pulse [pop/intense]
-   Score: 3.96 / 5.00
-   - mood match (+1.5)
-   - energy 0.93 vs target 0.92 (+1.98)
-   - acoustic fit (+0.47)
-
-3. Crimson Highway by Iron Meadow [rock/angry]
-   Score: 3.38 / 5.00
-   - genre match (+1.0)
-   - energy 0.88 vs target 0.92 (+1.92)
-   - acoustic fit (+0.46)
-
-4. Pulse Machine by Max Pulse [edm/energetic]
-   Score: 2.41 / 5.00
-   - energy 0.96 vs target 0.92 (+1.92)
-   - acoustic fit (+0.48)
-
-5. Sunrise City by Neon Echo [pop/happy]
-   Score: 2.21 / 5.00
-   - energy 0.82 vs target 0.92 (+1.80)
-   - acoustic fit (+0.41)
-```
-
-### Conflicted: sad mood but very high energy (adversarial)
-
-```
-Profile: conflicted_sad_but_loud {'genre': 'folk', 'mood': 'melancholy', 'energy': 0.9, 'likes_acoustic': True}
-Top recommendations:
-
-1. Empty Porch Light by Hollow Pines [folk/melancholy]
-   Score: 3.75 / 5.00
-   - genre match (+1.0)
-   - mood match (+1.5)
-   - energy 0.30 vs target 0.90 (+0.80)
-   - acoustic fit (+0.45)
-
-2. Broken Signal by Static Lilies [indie pop/melancholy]
-   Score: 3.00 / 5.00
-   - mood match (+1.5)
-   - energy 0.55 vs target 0.90 (+1.30)
-   - acoustic fit (+0.20)
-
-3. Dandelion Fields by Paper Lanterns [folk/happy]
-   Score: 2.67 / 5.00
-   - genre match (+1.0)
-   - energy 0.52 vs target 0.90 (+1.24)
-   - acoustic fit (+0.42)
-
-4. Storm Runner by Voltline [rock/intense]
-   Score: 2.03 / 5.00
-   - energy 0.91 vs target 0.90 (+1.98)
-   - acoustic fit (+0.05)
-
-5. Crimson Highway by Iron Meadow [rock/angry]
-   Score: 2.00 / 5.00
-   - energy 0.88 vs target 0.90 (+1.96)
-   - acoustic fit (+0.04)
-```
-
-### Mellow Rock: rock fan who wants quiet, chill songs (adversarial)
-
-```
-Profile: mellow_rock {'genre': 'rock', 'mood': 'chill', 'energy': 0.4, 'likes_acoustic': True}
-Top recommendations:
-
-1. Library Rain by Paper Lanterns [lofi/chill]
-   Score: 3.83 / 5.00
-   - mood match (+1.5)
-   - energy 0.35 vs target 0.40 (+1.90)
-   - acoustic fit (+0.43)
-
-2. Midnight Coding by LoRoom [lofi/chill]
-   Score: 3.81 / 5.00
-   - mood match (+1.5)
-   - energy 0.42 vs target 0.40 (+1.96)
-   - acoustic fit (+0.35)
-
-3. Spacewalk Thoughts by Orbit Bloom [ambient/chill]
-   Score: 3.72 / 5.00
-   - mood match (+1.5)
-   - energy 0.28 vs target 0.40 (+1.76)
-   - acoustic fit (+0.46)
-
-4. Drift Cloud by Orbit Bloom [ambient/chill]
-   Score: 3.61 / 5.00
-   - mood match (+1.5)
-   - energy 0.22 vs target 0.40 (+1.64)
-   - acoustic fit (+0.47)
-
-5. Focus Flow by LoRoom [lofi/focused]
-   Score: 2.39 / 5.00
-   - energy 0.40 vs target 0.40 (+2.00)
-   - acoustic fit (+0.39)
-```
-
-### Unknown tastes: genre and mood not in the catalog (adversarial)
-
-```
-Profile: unknown_tastes {'genre': 'classical', 'mood': 'sad', 'energy': 0.5, 'likes_acoustic': False}
-Top recommendations:
-
-1. Broken Signal by Static Lilies [indie pop/melancholy]
-   Score: 2.20 / 5.00
-   - energy 0.55 vs target 0.50 (+1.90)
-   - acoustic fit (+0.30)
-
-2. Velvet Evenings by Slow Stereo [jazz/romantic]
-   Score: 2.05 / 5.00
-   - energy 0.48 vs target 0.50 (+1.96)
-   - acoustic fit (+0.09)
-
-3. Heartbeat Replay by Neon Echo [pop/romantic]
-   Score: 2.05 / 5.00
-   - energy 0.65 vs target 0.50 (+1.70)
-   - acoustic fit (+0.35)
-
-4. Dandelion Fields by Paper Lanterns [folk/happy]
-   Score: 2.04 / 5.00
-   - energy 0.52 vs target 0.50 (+1.96)
-   - acoustic fit (+0.08)
-
-5. Golden Hour Drive by Neon Echo [synthwave/nostalgic]
-   Score: 2.01 / 5.00
-   - energy 0.68 vs target 0.50 (+1.64)
-   - acoustic fit (+0.38)
-```
-
-### What the outputs show
-
-- **Happy Pop vs Chill Lofi:** the pop profile gets loud, upbeat songs (energy around 0.8), and the lofi profile shifts to quiet, acoustic ones (energy around 0.35). The two lists share no songs, which is what opposite tastes should produce.
-- **Happy Pop vs Deep Intense Rock:** both want high energy, so Gym Hero appears in both lists. Genre and mood then pull the lists apart: Sunrise City for pop, Storm Runner and Crimson Highway for rock.
-- **Chill Lofi vs Deep Intense Rock:** no songs in common. Every preference points the other way: quiet vs loud, acoustic vs electric.
-- **Deep Intense Rock vs Mellow Rock:** same favorite genre, but the mellow rock fan gets no rock songs at all. Energy, mood and acoustic fit together outweigh the single genre point.
-- **Conflicted (sad but loud):** the quiet folk song wins because it matches the labels, and the loud songs that fit the energy request only show up at 4th and 5th.
-- **Unknown tastes:** none of the genre or mood labels match anything, so the system falls back on energy and acousticness. The scores are low (about 2 out of 5), which correctly signals a weak match, but the system never tells the user.
-
----
-
-## Experiments You Tried
-
-Both experiments are built into the CLI: `python -m src.main --experiment weight_shift` and `python -m src.main --experiment no_mood`. The maximum score changes with the weights (6.5 and 3.5 instead of 5.0), but every score still stays between 0 and that maximum, so the math remains valid.
-
-### Experiment 1: weight shift (energy x2, genre x0.5)
-
-Weights became energy 4.0, mood 1.5, genre 0.5, acoustic 0.5.
-
-| Profile | Baseline top 5 | After weight shift |
-|---|---|---|
-| Happy Pop | Sunrise City, Rooftop Lights, Gym Hero, Heartbeat Replay, Dandelion Fields | Sunrise City, Rooftop Lights, Gym Hero, **Dandelion Fields, Heartbeat Replay** (4th and 5th swap) |
-| Chill Lofi | Library Rain, Midnight Coding, Spacewalk Thoughts, Drift Cloud, Focus Flow | Same five, same order |
-| Deep Intense Rock | Storm Runner, Gym Hero, Crimson Highway, Pulse Machine, Sunrise City | Same five, same order |
-| Conflicted (sad but loud) | Empty Porch Light, Broken Signal, Dandelion Fields, Storm Runner, Crimson Highway | **Broken Signal** first, Empty Porch Light second, then Storm Runner, Crimson Highway, Gym Hero (loud rock songs pushed up) |
-| Mellow Rock | Library Rain, Midnight Coding, ... | Midnight Coding and Library Rain swap; no rock song either way |
-
-Result: **different, not clearly more accurate.** Rankings barely moved for users whose genre, mood and energy all agree. They changed mostly for the conflicted user, where the quiet folk song lost its first place because its energy (0.30) is far from 0.90. That feels slightly more faithful to the "loud" half of the request but gives up the "sad folk" half, so neither ordering is clearly right.
-
-### Experiment 2: remove the mood check
-
-Mood weight set to 0.
-
-| Profile | What changed |
+| File | Role |
 |---|---|
-| Happy Pop | **Gym Hero jumps from 3rd to 2nd**; Rooftop Lights (indie pop, happy) falls out of the top 5 and Crimson Highway, an angry rock song, appears. |
-| Chill Lofi | Ambient songs drop out; Focus Flow and Coffee Shop Stories (jazz, relaxed) move up. |
-| Deep Intense Rock | Crimson Highway (angry rock) rises from 3rd to 2nd above Gym Hero, which is arguably better for a rock fan. |
-| Conflicted | A happy folk song (Dandelion Fields) takes first place for a user who asked for sad. |
+| [src/rag.py](src/rag.py) | Guardrails, retriever, profile builder, answer generation, logging |
+| [src/recommender.py](src/recommender.py) | Original scoring and ranking logic from VibeMatch 1.0 |
+| [src/main.py](src/main.py) | Command-line interface (`--ask`, `--profile`, `--experiment`) |
+| [data/knowledge_base.json](data/knowledge_base.json) | 26 retrievable music notes |
+| [data/songs.csv](data/songs.csv) | 20-song catalog |
+| [tests/](tests) | 19 automated tests |
 
-Result: mood is doing real work. Without it, the system keeps the genre and energy matches but loses the "feel" of the request, so a user who wanted happy music gets an angry rock song. Keep it. The one case where removing mood looked better (intense rock) points to a different problem: `angry` and `intense` should earn partial credit instead of being treated as total opposites.
+## Setup Instructions
 
----
+Requires Python 3.10 or newer. Run all commands from the project root.
 
-## Limitations and Risks
+1. **Get the code**
 
-- **Labels can beat what the user actually wants.** A user who wanted sad music at very high energy got a quiet folk song first, because matching genre and mood is worth 2.5 points and the energy gap only cost 1.2.
-- **Tiny, made-up catalog.** With 20 songs, the same few (like Gym Hero) show up for many users.
-- **No partial credit and silent failures.** "Angry" rock earns nothing for an "intense rock" fan, and a mood that is not in the catalog (like "sad") is ignored without a warning.
-- **One favorite per category.** A user can have one genre and one mood, and the system cannot learn from behavior.
-- **It does not understand lyrics, language, or popularity.**
+   ```bash
+   git clone https://github.com/Shahad-Hossain/applied-ai-system-project.git
+   cd applied-ai-system-project
+   ```
 
-More detail is in the [Model Card](model_card.md).
+2. **Create a virtual environment** (recommended)
 
----
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate      # Mac or Linux
+   .venv\Scripts\activate         # Windows
+   ```
+
+3. **Install dependencies**
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+   Only `pytest` is required. The `anthropic` package is optional and used only by `--llm`.
+
+4. **Ask for recommendations**
+
+   ```bash
+   python -m src.main --ask "something calm for studying"
+   ```
+
+5. **Run the tests**
+
+   ```bash
+   python -m pytest
+   ```
+
+6. **Optional: Claude-written explanations.** Set an API key, then add `--llm`. Without a key, or if the call fails, the app falls back to the built-in template and says so.
+
+   ```bash
+   export ANTHROPIC_API_KEY=your-key      # PowerShell: $env:ANTHROPIC_API_KEY = "your-key"
+   python -m src.main --ask "something calm for studying" --llm
+   ```
+
+Other commands: `python -m src.main` runs the six original profiles, `--profile NAME` runs one, and `--experiment weight_shift|no_mood` runs the original weight experiments. Logs are written to `logs/recommender.log`.
+
+## Sample Interactions
+
+Outputs are from the real program (top picks shown; the full output lists 5 songs).
+
+### 1. A calm studying request
+
+```
+$ python -m src.main --ask "something calm for studying"
+
+What I looked up:
+  - Studying and deep focus (match 0.36): Studying, homework, reading, coding and deep work call for steady, low-energy music with no sudden changes.
+  - Calm and relaxed (match 0.24): When you want calm, relaxed, peaceful, mellow, laid-back or chill music, choose slow tempos and soft acoustic sounds with low energy.
+  - Ambient music (match 0.13): Ambient is spacious, slow and atmospheric, with floating textures instead of beats.
+
+Based on those notes I looked for: genre lofi, mood chill, energy near 0.35, acoustic sounds.
+
+My picks:
+  1. Library Rain by Paper Lanterns [lofi/chill] - score 4.93
+     genre match (+1.0), mood match (+1.5), energy 0.35 vs target 0.35 (+2.00), acoustic fit (+0.43)
+  2. Midnight Coding by LoRoom [lofi/chill] - score 4.71
+     genre match (+1.0), mood match (+1.5), energy 0.42 vs target 0.35 (+1.86), acoustic fit (+0.35)
+  3. Spacewalk Thoughts by Orbit Bloom [ambient/chill] - score 3.82
+     mood match (+1.5), energy 0.28 vs target 0.35 (+1.86), acoustic fit (+0.46)
+```
+
+### 2. A different request retrieves different notes and gets different songs
+
+```
+$ python -m src.main --ask "pump-up songs for the gym"
+
+What I looked up:
+  - Workout and gym (match 0.49): Workout, gym, running, lifting and cardio need high-energy, fast, driving music with a strong beat.
+  - Morning and good mood (match 0.10): Waking up, sunny mornings, cheerful, happy, positive and feel-good moments suit bright, upbeat pop.
+
+Based on those notes I looked for: genre edm, mood energetic, energy near 0.91, electric/electronic sounds.
+
+My picks:
+  1. Pulse Machine by Max Pulse [edm/energetic] - score 4.89
+     genre match (+1.0), mood match (+1.5), energy 0.96 vs target 0.91 (+1.90), acoustic fit (+0.48)
+  2. Storm Runner by Voltline [rock/intense] - score 2.45
+     energy 0.91 vs target 0.91 (+2.00), acoustic fit (+0.45)
+  3. Gym Hero by Max Pulse [pop/intense] - score 2.44
+     energy 0.93 vs target 0.91 (+1.96), acoustic fit (+0.47)
+```
+
+### 3. An emotional request
+
+```
+$ python -m src.main --ask "sad songs after a breakup"
+
+What I looked up:
+  - Sad and reflective (match 0.31): When you want sad, melancholy, reflective, emotional, lonely or blue music, choose slow, quiet songs with low energy and acoustic warmth.
+  - Heartbreak and feeling down (match 0.30): Breakups, heartbreak, sadness, crying and feeling lonely suit slow, sad, melancholy music.
+
+Based on those notes I looked for: genre folk, mood melancholy, energy near 0.31, acoustic sounds.
+
+My picks:
+  1. Empty Porch Light by Hollow Pines [folk/melancholy] - score 4.93
+     genre match (+1.0), mood match (+1.5), energy 0.30 vs target 0.31 (+1.98), acoustic fit (+0.45)
+  2. Broken Signal by Static Lilies [indie pop/melancholy] - score 3.22
+     mood match (+1.5), energy 0.55 vs target 0.31 (+1.52), acoustic fit (+0.20)
+```
+
+### 4. Guardrails: bad input and unknown requests
+
+```
+$ python -m src.main --ask "a"
+[invalid] Request is empty or too short.
+
+$ python -m src.main --ask "asdfgh qwerty"
+[no_match] I couldn't find anything in my music notes for that. Try something like: "something calm for studying"; "pump-up songs for the gym"; "sad songs after a breakup"; "music for a late night drive"
+```
+
+## Design Decisions
+
+- **RAG over a plain LLM.** The profile is built only from retrieved notes, so the answer is grounded in data I can read, edit and test. A chat model asked to "recommend songs" could invent songs that are not in the catalog. Here the model (or template) can only explain songs the scorer actually ranked.
+- **Reused the original scorer.** The new feature changes how the profile is created, not how songs are scored. That kept the proven, explainable scoring rule from Modules 1-3 and made it easy to tell whether a change came from retrieval or from scoring.
+- **Plain-Python TF-IDF instead of embeddings.** There is no model download, no API key and no extra dependency, and results are fully deterministic, so tests can assert exact behavior. The trade-off is that it matches words, not meaning (see Testing Summary).
+- **Offline by default, LLM optional.** Retrieval, profile building and the template answer need no network. The `--llm` flag is a thin layer that always falls back, so a missing key or network error never breaks the app.
+- **A small hand-written knowledge base.** 26 short notes are easy to audit and fix, but they limit what the system understands. Each note carries structured hints (genre, mood, energy, acoustic) so retrieved text can directly drive the profile.
+- **Guardrails fail safe.** Bad input, no matching note, a malformed data file, and any unexpected error each produce a clear message or error result instead of a crash or a made-up answer. Every step is logged.
+- **Weighted voting for blended requests.** When several notes match, they vote by similarity. That handles "relaxing jazz for dinner" well, but it can average conflicting requests into a middle that satisfies neither half (see Testing Summary).
+
+## Testing Summary
+
+**Automated:** `python -m pytest` runs 19 tests, all passing. The 17 new tests in [tests/test_rag.py](tests/test_rag.py) check that:
+
+- retrieval finds the right note ("pump-up songs for the gym" finds the Workout note) and returns nothing for gibberish;
+- different retrieved notes change the recommendations (calm study request gets lofi at energy below 0.5; the gym request gets EDM above 0.5);
+- answers cite every retrieved note;
+- the same request always gives the same result;
+- every guardrail rejects bad input (`None`, numbers, empty, too short, no letters, over 300 characters);
+- `--llm` falls back to the template when no API key is set;
+- a corrupt knowledge base raises a clear error.
+
+**What worked:** clear requests tied to an activity, genre or mood ("calm for studying", "angry music to vent", "workout music", "something to fall asleep to") retrieved the right note and ranked a matching song first. The guardrails and the no-match path behaved as designed.
+
+**What didn't work, found by trying other requests by hand:**
+
+- **Words, not meaning.** "classical piano" matched the *Jazz* note only because both mention piano. The system then recommended jazz without saying the catalog has no classical music.
+- **Conflicting requests get averaged.** "Something sad but also really loud" blended the sad notes (energy about 0.32) with the intense note (about 0.90) into a target of 0.43. The result is a quiet folk song first, and the "loud" half is mostly lost.
+- **Near-miss retrieval.** "Chill beats for a rainy afternoon" retrieved the *Rainy day* note ahead of the *Lofi* note and returned jazz, where lofi would probably suit better.
+- **Not measured:** there is no labeled evaluation set, so I checked retrieval quality by reading results rather than computing a score. The `--llm` path has not been run against the live API.
+
+**What I learned:** tests are good at proving the system is repeatable and safe, but they don't prove it is *right*. The most useful discoveries came from typing requests I hadn't designed for. The next improvements are a "this catalog has nothing like that" warning when the best match is weak, and a small labeled set of requests for measuring retrieval quality.
 
 ## Reflection
 
-Full model card: [**Model Card**](model_card.md)
+Building this showed me that adding AI to a system is mostly about what you let it control. Retrieval was only useful once the retrieved text actually changed the profile and the picks, instead of being printed beside an unchanged answer. Guardrails and logs took as much thought as the retrieval itself, and the failures I found came from realistic inputs, not from the code. It also reinforced that a transparent, explainable score is what makes an AI system reviewable by a person.
 
-**What I learned about how recommenders turn data into predictions.** A recommender is just three steps: describe the songs with numbers and labels, describe the user the same way, and score how close the two are. My scoring rule is only a few additions, but seeing "mood match (+1.5)" next to a song made it feel like a real recommendation. The weights ended up mattering more than the math. When I tried the common "genre 2.0, mood 1.0" starting point, a rock fan who wanted quiet songs got loud rock first. Changing one number changed who got what.
+My full responsible-AI reflection (how I collaborated with AI, a suggestion I accepted and one I revised, and the system's limitations) is in the [Model Card](model_card.md).
 
-**Where bias or unfairness could show up.** The system treats genre and mood as all-or-nothing labels, so it favors users whose tastes match the catalog's labels and quietly fails for everyone else. A user who asked for "sad" got results anyway, even though nothing in the catalog is called "sad". In a real app, the same problem could appear as popular songs getting more exposure because they have more data, or niche listeners getting worse suggestions because fewer songs fit them.
+## More Documentation
 
-
-
+- [Model Card](model_card.md): intended use, biases, evaluation and responsible-AI reflection
+- [docs/original_project.md](docs/original_project.md): full VibeMatch 1.0 write-up, stress tests and weight experiments
+- [diagrams/architecture.mmd](diagrams/architecture.mmd): architecture diagram source (Mermaid)
