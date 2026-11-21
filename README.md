@@ -83,34 +83,63 @@ In a trial run of the recipe these two profiles shared no songs in their top 4, 
 
 ### Setup
 
-1. Create a virtual environment (optional but recommended):
-
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate      # Mac or Linux
-   .venv\Scripts\activate         # Windows
-
-2. Install dependencies
+Requires Python 3.10+. Run everything from the project root.
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate      # Mac or Linux
+.venv\Scripts\activate         # Windows
 pip install -r requirements.txt
 ```
 
-3. Run the app:
+Run the original profile demo (no AI request, no network):
 
 ```bash
 python -m src.main
 ```
 
-### Running Tests
-
-Run the starter tests with:
+Run the AI feature, a free-text request answered with retrieval-augmented recommendations:
 
 ```bash
-pytest
+python -m src.main --ask "something calm for studying"
 ```
 
-You can add more tests in `tests/test_recommender.py`.
+Optional: let Claude write the explanation instead of the built-in template. This is the only part that needs a network connection or an API key; if the key is missing or the call fails, the app falls back to the template automatically.
+
+```bash
+export ANTHROPIC_API_KEY=your-key      # Windows PowerShell: $env:ANTHROPIC_API_KEY = "your-key"
+python -m src.main --ask "something calm for studying" --llm
+```
+
+### Running Tests
+
+```bash
+python -m pytest
+```
+
+---
+
+## AI Feature: Retrieval-Augmented Generation (RAG)
+
+`--ask` takes a plain-English request instead of a hand-written profile. The code is in [src/rag.py](src/rag.py) and it is part of the main recommendation path, not a separate script:
+
+1. **Guardrails** check the request (must be text, 3 to 300 characters, contain letters).
+2. **Retrieve**: the request is matched against a knowledge base of 26 short notes in [data/knowledge_base.json](data/knowledge_base.json) (activities like studying or working out, genres, and moods) using TF-IDF cosine similarity. It is written in plain Python, so there is nothing extra to install.
+3. **Augment**: the top matching notes vote on the taste profile (genre, mood, target energy, acoustic preference). The profile is built **only** from the retrieved notes, so a different request retrieves different notes and gets different songs. For example, "calm for studying" retrieves the *Studying* note and returns lofi at energy 0.35, while "pump-up songs for the gym" retrieves the *Workout* note and returns EDM at energy 0.91.
+4. **Recommend**: the profile goes through the same scoring rule as before.
+5. **Generate**: the answer cites the notes it used and lists the score breakdown for each song. With `--llm`, Claude writes the explanation from the retrieved notes and ranked songs, and is told not to invent facts.
+
+### Reliability and safety
+
+- **Logging**: every request, the notes retrieved, the profile built and the top pick are written to `logs/recommender.log` (git-ignored).
+- **Bad input**: empty, too short, too long, non-text or word-free requests are rejected with a message instead of crashing.
+- **No match**: a request the knowledge base can't relate to (for example `asdfgh qwerty`) returns example requests, not random songs.
+- **Failures**: a missing or malformed data file stops with a clear error; any failure inside the pipeline returns an error result and is logged; any Claude failure falls back to the template.
+- **Tests**: [tests/test_rag.py](tests/test_rag.py) checks that retrieval finds the right note, that different notes change the recommendations, that answers cite their sources, that results are repeatable, and that every guardrail works.
+
+### Known limits of the RAG feature
+
+The knowledge base is small and hand-written, so the vocabulary it understands is limited. Retrieval matches words, not meaning, so a request using none of the words in the notes returns `no_match`. The `--llm` path has not been exercised against the live API in this repository's tests.
 
 ---
 

@@ -7,10 +7,13 @@ Run from the project root with: python -m src.main
 Options:
   --profile NAME      run a single profile instead of all of them
   --experiment NAME   weight_shift (energy x2, genre x0.5) or no_mood (mood check off)
+  --ask "TEXT"        free-text request answered with retrieval-augmented recommendations
+  --llm               with --ask, let Claude write the answer (needs ANTHROPIC_API_KEY)
 """
 
 import argparse
 
+from src.rag import Retriever, ask, load_knowledge_base, setup_logging
 from src.recommender import DEFAULT_WEIGHTS, load_songs, recommend_songs
 
 
@@ -52,10 +55,29 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=PROFILES)
     parser.add_argument("--experiment", choices=EXPERIMENTS)
+    parser.add_argument("--ask", metavar="TEXT", help="free-text request (RAG mode)")
+    parser.add_argument("--llm", action="store_true", help="use Claude to write the --ask answer")
     args = parser.parse_args()
 
-    songs = load_songs("data/songs.csv")
+    setup_logging()
+    try:
+        songs = load_songs("data/songs.csv")
+    except (OSError, ValueError, KeyError) as exc:
+        raise SystemExit(f"Could not load data/songs.csv: {exc}")
     print(f"Loaded songs: {len(songs)}")
+
+    if args.ask is not None:
+        try:
+            retriever = Retriever(load_knowledge_base())
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        result = ask(args.ask, songs, retriever, use_llm=args.llm)
+        print()
+        print(result.answer if result.status == "ok" else f"[{result.status}] {result.message}")
+        if args.llm and result.status == "ok" and not result.used_llm:
+            print("\n(Claude was unavailable, so the built-in template wrote this answer.)")
+        return
+
     weights = EXPERIMENTS[args.experiment] if args.experiment else None
     if weights:
         print(f"Experiment: {args.experiment} weights = {weights}")
